@@ -1,12 +1,12 @@
 """Ocena kompozycji planszy prostymi miarami geometrycznymi.
 
-Pokrycie siatki nie wchodzi do wyniku. Jest osobnym, niskim priorytetem
-przy wyborze między kandydatami o zbliżonej jakości.
+Pokrycie siatki jest osobną miarą. Wynik wizualny opisuje rozłożenie,
+a nie samą liczbę zajętych komórek.
 """
 
 from __future__ import annotations
 
-from engine import Board, bend_count
+from engine import DIRECTION_DELTA, Board, bend_count, ray_cells
 
 VISUAL_WEIGHTS = {
     "balance": 0.28,
@@ -92,6 +92,7 @@ def spatial_balance(board: Board) -> dict:
     void = hole_share * (1.0 - even_cells)
     openness = _clamp(1.0 - void / 0.50)
     spread = _head_spread(board)
+    half = _half_balance(board)
     parts = {
         "quadrants": even_cells,
         "heads": even_heads,
@@ -99,16 +100,104 @@ def spatial_balance(board: Board) -> dict:
         "local": local,
         "openness": openness,
         "spread": spread,
+        "half": half,
     }
     score = (
-        0.26 * even_cells
-        + 0.18 * even_heads
-        + 0.14 * used
-        + 0.14 * local
-        + 0.14 * openness
+        0.22 * even_cells
+        + 0.16 * even_heads
+        + 0.12 * used
+        + 0.12 * local
+        + 0.12 * openness
         + 0.14 * spread
+        + 0.12 * half
     )
     return {"score": _clamp(score), "parts": parts, "largest_empty": largest}
+
+
+def _half_balance(board: Board) -> float:
+    """0 gdy cała masa komórek leży w jednej połowie wierszy albo kolumn."""
+    total = len(board.occupied)
+    if total <= 0:
+        return 1.0
+    mid = board.size / 2
+    top = sum(1 for row, _col in board.occupied if row < mid)
+    left = sum(1 for _row, col in board.occupied if col < mid)
+    return min(top, total - top, left, total - left) / total
+
+
+def empty_runs(board: Board) -> tuple[int, int]:
+    """Najdłuższy ciąg całkowicie pustych wierszy i kolumn."""
+    return _empty_run(board, True), _empty_run(board, False)
+
+
+def _empty_run(board: Board, rows: bool) -> int:
+    best = 0
+    current = 0
+    for index in range(board.size):
+        if rows:
+            empty = all((index, col) not in board.occupied for col in range(board.size))
+        else:
+            empty = all((row, index) not in board.occupied for row in range(board.size))
+        current = current + 1 if empty else 0
+        best = max(best, current)
+    return best
+
+
+def fillability(board: Board) -> float:
+    """Jaka część pustych komórek nadaje się na poprawną strzałkę."""
+    components = _empty_components(board)
+    if not components:
+        return 1.0
+    usable = 0
+    trapped = 0
+    for component in components:
+        if len(component) >= 4 and _component_holds_arrow(component, board):
+            usable += len(component)
+        else:
+            trapped += len(component)
+    total = usable + trapped
+    return usable / total if total else 1.0
+
+
+def _empty_components(board: Board) -> list[list[tuple[int, int]]]:
+    seen: set[tuple[int, int]] = set()
+    components: list[list[tuple[int, int]]] = []
+    for row in range(board.size):
+        for col in range(board.size):
+            start = (row, col)
+            if start in board.occupied or start in seen:
+                continue
+            stack = [start]
+            seen.add(start)
+            component: list[tuple[int, int]] = []
+            while stack:
+                cell = stack.pop()
+                component.append(cell)
+                for d_row, d_col in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    nxt = (cell[0] + d_row, cell[1] + d_col)
+                    if (
+                        not (0 <= nxt[0] < board.size and 0 <= nxt[1] < board.size)
+                        or nxt in board.occupied
+                        or nxt in seen
+                    ):
+                        continue
+                    seen.add(nxt)
+                    stack.append(nxt)
+            components.append(component)
+    components.sort(key=len, reverse=True)
+    return components
+
+
+def _component_holds_arrow(component: list[tuple[int, int]], board: Board) -> bool:
+    area = set(component)
+    for row, col in component:
+        for name, (d_row, d_col) in DIRECTION_DELTA.items():
+            behind = (row - d_row, col - d_col)
+            if behind not in area:
+                continue
+            if all(cell not in board.occupied for cell in ray_cells(row, col, name, board.size)):
+                return True
+    return False
 
 
 def _head_spread(board: Board) -> float:

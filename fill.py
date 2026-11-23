@@ -25,8 +25,8 @@ from engine import (
 )
 from difficulty import profile_for, selection_rank
 
-_MAX_FILL = 8
-_NODE_LIMIT = 8
+_MAX_FILL = 20
+_NODE_LIMIT = 20
 _GROW_CAP = 48
 _NEIGHBORS = ((-1, 0), (0, 1), (1, 0), (0, -1))
 
@@ -84,7 +84,7 @@ def select_variant(core: Board, variants: list[Board], difficulty: int = 3) -> t
     accepted: list[Board] = []
     dropped = 0
     for board in variants:
-        if _accept(core, board, core_free):
+        if _accept(core, board, core_free, profile):
             accepted.append(board)
         else:
             dropped += 1
@@ -95,19 +95,13 @@ def select_variant(core: Board, variants: list[Board], difficulty: int = 3) -> t
 
 def _fill_key(board: Board, profile, core: Board) -> tuple:
     rank = selection_rank(board, profile)
-    if _open_rows(core) < 3:
-        return rank
     extra = len(board.occupied) - len(core.occupied)
-    band = round(rank[3] * 20)
-    return (band, extra, *rank[1:])
-
-
-def _open_rows(board: Board) -> int:
-    count = 0
-    for row in range(board.size):
-        if all((row, col) not in board.occupied for col in range(board.size)):
-            count += 1
-    return count
+    primary = rank[0]
+    if extra > 0:
+        core_rank = selection_rank(core, profile)
+        if rank[4] + 0.04 >= core_rank[4]:
+            primary = max(primary, core_rank[0])
+    return (primary, extra, rank[4])
 
 
 def _chain_candidate(
@@ -138,7 +132,7 @@ def _blocks_now(arrow: Arrow, board: Board) -> int:
     return blocked
 
 
-def _accept(core: Board, board: Board, core_free: int) -> bool:
+def _accept(core: Board, board: Board, core_free: int, profile=None) -> bool:
     if not _same_core(core, board):
         return False
     order, error = solve_board(board)
@@ -150,7 +144,8 @@ def _accept(core: Board, board: Board, core_free: int) -> bool:
     fill = board.arrows[len(core.arrows) :]
     if not fill:
         return True
-    if free > core_free + 2:
+    cap = 2 if profile is None else profile.fill_free_cap
+    if free > core_free + cap:
         return False
     if len(fill) >= 6:
         short = sum(1 for arrow in fill if len(arrow.cells) == 2)
@@ -184,26 +179,57 @@ def _candidates(rng: random.Random, board: Board, profile=None) -> list[Arrow]:
         found.append(arrow)
         next_id += 1
 
+    if profile is not None and profile.level == 1:
+        for head, direction in _region_starts(board)[:8]:
+            take(_grow(rng, board, head, direction))
+            if len(found) >= 10:
+                return _ranked(found, board, profile)
     free_arrows = [arrow for arrow in board.arrows if can_move(arrow, board)]
     rng.shuffle(free_arrows)
-    for target in free_arrows[:4]:
+    for target in free_arrows[:6]:
         pivots = [cell for cell in exit_cells(target, board.size) if cell not in board.occupied]
         rng.shuffle(pivots)
-        for pivot in pivots[:2]:
+        for pivot in pivots[:3]:
             directions = list(DIRECTIONS)
             rng.shuffle(directions)
-            for direction in directions[:2]:
+            for direction in directions[:3]:
                 take(_grow(rng, board, pivot, direction))
                 if len(found) >= 8:
                     return _ranked(found, board, profile)
 
+    for head, direction in _region_starts(board)[:6]:
+        take(_grow(rng, board, head, direction))
+        if len(found) >= 14:
+            break
     heads = _chainable_heads(board)
     rng.shuffle(heads)
-    for head, direction in heads[:6]:
+    for head, direction in heads[:4]:
         take(_grow(rng, board, head, direction))
-        if len(found) >= 8:
+        if len(found) >= 14:
             break
     return _ranked(found, board, profile)
+
+
+def _region_starts(board: Board) -> list[tuple[tuple[int, int], str]]:
+    """Głowy w dużych pustych obszarach, z wolnym wyjazdem i miejscem na ogon."""
+    starts: list[tuple[tuple[int, int], str]] = []
+    for component in _components(board):
+        if len(component) < 6:
+            continue
+        area = set(component)
+        for row, col in component:
+            for name, (d_row, d_col) in DIRECTION_DELTA.items():
+                behind = (row - d_row, col - d_col)
+                if behind not in area:
+                    continue
+                if any(cell in board.occupied for cell in ray_cells(row, col, name, board.size)):
+                    continue
+                starts.append(((row, col), name))
+                if len(starts) >= 8:
+                    return starts
+        if starts:
+            break
+    return starts
 
 
 def _ranked(arrows: list[Arrow], board: Board, profile=None) -> list[Arrow]:
@@ -232,10 +258,13 @@ def _score(arrow: Arrow, board: Board, base_holes: int, profile=None) -> int:
                 break
     bends = bend_count(arrow.cells)
     length = len(arrow.cells)
-    length_fit = 2 if 4 <= length <= 6 else (1 if length >= 3 else 0)
+    length_bonus = length if length >= 3 else 0
     bend_fit = 1 if bends == 1 else 0
     twist_penalty = 3 if bends >= 3 else 0
-    score = fresh * 8 + length_fit * 2 + bend_fit - twist_penalty - max(0, holes) * 4
+    if profile is not None and profile.level <= 2:
+        score = length_bonus * 3 + fresh + bend_fit - twist_penalty - max(0, holes) * 4
+    else:
+        score = fresh * 6 + length_bonus * 2 + bend_fit - twist_penalty - max(0, holes) * 4
     if profile is not None and profile.tip_weight >= 6 and board.occupied:
         counts = [0, 0, 0, 0]
         mid = board.size / 2
@@ -296,8 +325,9 @@ def _grow(
         return None
     local = random.Random(rng.randrange(1 << 30))
     want_bend = local.random() < 0.42
-    lengths = [8, 7, 6, 5, 4, 3, 2]
-    local.shuffle(lengths)
+    lengths = [8, 6, 7, 5, 4, 3, 2]
+    if local.random() < 0.25:
+        local.shuffle(lengths)
     forbidden = set(ray_cells(head[0], head[1], direction, board.size))
     for length in lengths:
         cells = _grow_exact(local, board, head, direction, length, want_bend, forbidden)

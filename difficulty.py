@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 from engine import Board, bend_count
 from quality_logic import analyze_logic
-from quality_visual import analyze_visual, spatial_balance
+from quality_visual import analyze_visual, empty_runs, fillability, spatial_balance
 
 LABELS = {
     1: "Bardzo łatwa",
@@ -49,6 +49,8 @@ class DifficultyProfile:
     visual_search: tuple[float, float]
     join_ratio: tuple[float, float]
     choices: tuple[float, float]
+    coverage: tuple[float, float]
+    fill_free_cap: int
     tip_weight: int
     min_spatial: float
     blocking_bias: float
@@ -82,32 +84,34 @@ PROFILES = {
     1: _profile(
         level=1,
         label=LABELS[1],
-        core_arrows=(7, 9),
-        total_arrows=(7, 10),
-        free_ratio=(0.42, 0.72),
-        depth=(2, 4),
+        core_arrows=(8, 14),
+        total_arrows=(12, 28),
+        free_ratio=(0.28, 0.72),
+        depth=(2, 6),
         blocks_per_arrow=(0.20, 0.80),
         first_share=(0.42, 0.75),
-        visual_search=(0.05, 0.30),
-        join_ratio=(0.00, 0.25),
-        choices=(2.0, 4.2),
+        visual_search=(0.08, 0.48),
+        join_ratio=(0.00, 0.40),
+        choices=(2.2, 6.2),
+        coverage=(0.55, 0.75),
+        fill_free_cap=10,
         tip_weight=0,
         min_spatial=0.40,
         blocking_bias=0.20,
         prefer_block=0.15,
         block_weight=1,
-        max_open=9,
-        turn_probability=0.10,
-        archetype_weights=(8, 2, 2, 1),
-        long_length=5,
+        max_open=12,
+        turn_probability=0.16,
+        archetype_weights=(3, 4, 3, 2),
+        long_length=8,
         spread_bonus=3,
-        stagnant=22,
-        fill_budget=0,
-        fill_variants=1,
-        free_slack=2,
+        stagnant=24,
+        fill_budget=12,
+        fill_variants=3,
+        free_slack=6,
         trials=10,
-        finalists=1,
-        hard_arrows=(6, 12),
+        finalists=3,
+        hard_arrows=(6, 18),
         hard_min_free=2,
         hard_min_blocked=1,
         hard_free_le_blocked=False,
@@ -118,8 +122,8 @@ PROFILES = {
     2: _profile(
         level=2,
         label=LABELS[2],
-        core_arrows=(9, 12),
-        total_arrows=(10, 14),
+        core_arrows=(10, 16),
+        total_arrows=(14, 32),
         free_ratio=(0.30, 0.50),
         depth=(4, 7),
         blocks_per_arrow=(0.65, 1.25),
@@ -127,6 +131,8 @@ PROFILES = {
         visual_search=(0.15, 0.42),
         join_ratio=(0.05, 0.30),
         choices=(1.6, 3.4),
+        coverage=(0.54, 0.74),
+        fill_free_cap=5,
         tip_weight=0,
         min_spatial=0.38,
         blocking_bias=0.48,
@@ -134,16 +140,16 @@ PROFILES = {
         block_weight=3,
         max_open=7,
         turn_probability=0.18,
-        archetype_weights=(5, 2, 3, 2),
-        long_length=6,
+        archetype_weights=(2, 4, 3, 3),
+        long_length=8,
         spread_bonus=2,
         stagnant=26,
-        fill_budget=2,
+        fill_budget=12,
         fill_variants=3,
-        free_slack=1,
+        free_slack=3,
         trials=12,
-        finalists=2,
-        hard_arrows=(8, 15),
+        finalists=3,
+        hard_arrows=(8, 20),
         hard_min_free=2,
         hard_min_blocked=1,
         hard_free_le_blocked=False,
@@ -155,7 +161,7 @@ PROFILES = {
         level=3,
         label=LABELS[3],
         core_arrows=(12, 16),
-        total_arrows=(12, 18),
+        total_arrows=(16, 34),
         free_ratio=(0.18, 0.38),
         depth=(6, 11),
         blocks_per_arrow=(1.05, 1.85),
@@ -163,6 +169,8 @@ PROFILES = {
         visual_search=(0.20, 0.55),
         join_ratio=(0.18, 0.48),
         choices=(1.4, 2.8),
+        coverage=(0.60, 0.82),
+        fill_free_cap=2,
         tip_weight=0,
         min_spatial=0.30,
         blocking_bias=0.78,
@@ -170,15 +178,15 @@ PROFILES = {
         block_weight=5,
         max_open=12,
         turn_probability=0.30,
-        archetype_weights=(3, 2, 3, 4),
+        archetype_weights=(2, 3, 3, 4),
         long_length=8,
         spread_bonus=1,
         stagnant=28,
-        fill_budget=8,
-        fill_variants=4,
+        fill_budget=14,
+        fill_variants=3,
         free_slack=1,
         trials=14,
-        finalists=1,
+        finalists=3,
         hard_arrows=(12, 16),
         hard_min_free=1,
         hard_min_blocked=1,
@@ -190,8 +198,8 @@ PROFILES = {
     4: _profile(
         level=4,
         label=LABELS[4],
-        core_arrows=(13, 16),
-        total_arrows=(13, 19),
+        core_arrows=(13, 18),
+        total_arrows=(16, 36),
         free_ratio=(0.12, 0.30),
         depth=(9, 13),
         blocks_per_arrow=(1.15, 1.80),
@@ -199,23 +207,25 @@ PROFILES = {
         visual_search=(0.28, 0.52),
         join_ratio=(0.32, 0.62),
         choices=(1.05, 2.00),
-        tip_weight=8,
+        coverage=(0.64, 0.86),
+        fill_free_cap=2,
+        tip_weight=6,
         min_spatial=0.28,
         blocking_bias=0.88,
         prefer_block=0.94,
         block_weight=6,
-        max_open=5,
-        turn_probability=0.30,
-        archetype_weights=(2, 2, 4, 4),
+        max_open=6,
+        turn_probability=0.34,
+        archetype_weights=(2, 3, 3, 4),
         long_length=8,
-        spread_bonus=1,
+        spread_bonus=2,
         stagnant=28,
-        fill_budget=2,
+        fill_budget=10,
         fill_variants=2,
         free_slack=1,
-        trials=8,
-        finalists=1,
-        hard_arrows=(12, 22),
+        trials=10,
+        finalists=2,
+        hard_arrows=(12, 24),
         hard_min_free=1,
         hard_min_blocked=1,
         hard_free_le_blocked=True,
@@ -226,8 +236,8 @@ PROFILES = {
     5: _profile(
         level=5,
         label=LABELS[5],
-        core_arrows=(14, 16),
-        total_arrows=(13, 19),
+        core_arrows=(14, 20),
+        total_arrows=(16, 36),
         free_ratio=(0.06, 0.20),
         depth=(10, 16),
         blocks_per_arrow=(1.20, 1.90),
@@ -235,23 +245,25 @@ PROFILES = {
         visual_search=(0.30, 0.55),
         join_ratio=(0.40, 0.70),
         choices=(1.00, 1.70),
-        tip_weight=16,
+        coverage=(0.68, 0.90),
+        fill_free_cap=2,
+        tip_weight=10,
         min_spatial=0.28,
         blocking_bias=0.93,
         prefer_block=0.97,
         block_weight=6,
-        max_open=4,
-        turn_probability=0.30,
-        archetype_weights=(2, 2, 4, 4),
+        max_open=5,
+        turn_probability=0.36,
+        archetype_weights=(2, 3, 3, 4),
         long_length=8,
-        spread_bonus=1,
+        spread_bonus=2,
         stagnant=30,
-        fill_budget=3,
+        fill_budget=10,
         fill_variants=2,
-        free_slack=0,
-        trials=8,
-        finalists=1,
-        hard_arrows=(13, 20),
+        free_slack=1,
+        trials=10,
+        finalists=2,
+        hard_arrows=(12, 26),
         hard_min_free=1,
         hard_min_blocked=1,
         hard_free_le_blocked=True,
@@ -298,6 +310,11 @@ def analyze_difficulty(board: Board) -> dict:
         "mean_bends": (sum(bends) / denom) if arrows else 0.0,
         "mean_length": (sum(lengths) / denom) if arrows else 0.0,
         "visual_search": visual_search_complexity(board),
+        "coverage": len(board.occupied) / (board.size * board.size),
+        "fillability": fillability(board),
+        "empty_row_run": empty_runs(board)[0],
+        "empty_col_run": empty_runs(board)[1],
+        "half_balance": spatial["parts"].get("half", 0.0),
         "spatial": spatial["score"],
         "spatial_parts": spatial["parts"],
         "largest_empty": spatial["largest_empty"],
@@ -373,28 +390,37 @@ def outside_targets(report: dict, profile: DifficultyProfile) -> list[str]:
         "choices": range_fit(report["mean_choices"], *profile.choices),
         "visual_search": range_fit(report["visual_search"], *profile.visual_search),
         "arrows": range_fit(report["arrows"], *profile.total_arrows),
+        "coverage": range_fit(report["coverage"], *profile.coverage),
     }
     return [name for name, value in checks.items() if value < 1.0]
 
 
-def selection_rank(board: Board, profile: DifficultyProfile | int | None = None) -> tuple:
-    """Najpierw odległość logiczna od profilu, potem rozłożenie, na końcu pokrycie."""
+def selection_rank(
+    board: Board,
+    profile: DifficultyProfile | int | None = None,
+    stage: str = "final",
+) -> tuple:
+    """Rdzeń: logika i wypełnialność. Final: żaden z tych dwóch nie zasłania drugiego."""
     if not isinstance(profile, DifficultyProfile):
         profile = profile_for(3 if profile is None else profile)
     report = analyze_difficulty(board)
     logic = profile_fit(report, profile)
-    if profile.level <= 2:
-        cover = -len(board.occupied)
-    elif profile.level >= 4:
-        cover = len(board.occupied)
-    else:
-        cover = 0
+    if stage == "core":
+        return (
+            int(logic * 40),
+            int(report["fillability"] * 20),
+            int(report["spatial"] * 20),
+            round(logic, 5),
+            int(report["coverage"] * 100),
+        )
+    cover = center_fit(report["coverage"], *profile.coverage)
+    paired = min(logic, cover)
     return (
-        int(logic * 40),
+        int(paired * 40),
+        int((logic + cover) * 20),
+        int(report["half_balance"] * 20),
         int(report["spatial"] * 20),
-        int(visual_fit(report, profile) * 20),
-        round(logic, 5),
-        cover,
+        round(paired, 5),
     )
 
 

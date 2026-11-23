@@ -33,6 +33,7 @@ from engine import (
 from difficulty import (
     analyze_difficulty,
     outside_targets,
+    center_fit,
     profile_fit,
     profile_for,
     selection_rank,
@@ -108,7 +109,7 @@ def build_puzzle(seed: int, size: int = 12, *, report: bool = True, difficulty: 
         final, fill_stats = _apply_fill(core, seed, difficulty, index)
         if not _verified(final):
             continue
-        key = _rank(final, profile)
+        key = _rank(final, profile, "final")
         if best is None or key > best[0]:
             best = (key, core, final, fill_stats)
     if best is None:
@@ -195,7 +196,6 @@ def _attach_difficulty(stats: dict, board: Board, profile, hard_miss: bool) -> N
     stats["label"] = profile.label
     stats["fit"] = fit
     stats["deviation"] = 1.0 - fit
-    stats["profile_miss"] = hard_miss or fit < 0.58
     stats["outside"] = outside_targets(report, profile)
     stats["free_ratio"] = report["free_ratio"]
     stats["logic_difficulty"] = report["logic_difficulty"]
@@ -208,6 +208,14 @@ def _attach_difficulty(stats: dict, board: Board, profile, hard_miss: bool) -> N
     stats["largest_empty"] = report["largest_empty"]
     stats["mean_bends"] = report["mean_bends"]
     stats["mean_length"] = report["mean_length"]
+    stats["coverage"] = report["coverage"]
+    stats["fillability"] = report["fillability"]
+    stats["empty_row_run"] = report["empty_row_run"]
+    stats["empty_col_run"] = report["empty_col_run"]
+    stats["half_balance"] = report["half_balance"]
+    cover_fit = center_fit(report["coverage"], *profile.coverage)
+    stats["coverage_fit"] = cover_fit
+    stats["profile_miss"] = hard_miss or fit < 0.55 or cover_fit < 0.40
 
 
 class CoreReport:
@@ -438,7 +446,11 @@ def _block_target(
         rng.shuffle(directions)
         if prefer_room:
             directions.sort(key=lambda name: _direction_rank(pivot, name, board))
-        attempts = ((4, False, 0.0), (3, False, 0.0), (2, False, 0.0)) if prefer_room else (None,)
+        attempts = (
+            ((6, False, 0.0), (5, True, 0.45), (4, False, 0.0), (3, False, 0.0))
+            if prefer_room
+            else (None,)
+        )
         for direction in directions:
             for forced in attempts:
                 arrow = _arrow_from_head(rng, board, pivot, direction, profile, forced)
@@ -752,9 +764,9 @@ def _acceptable(board: Board, profile) -> bool:
     return curved >= profile.hard_min_curved and straight >= profile.hard_min_straight
 
 
-def _rank(board: Board, profile) -> tuple:
-    """Zgodność z poziomem, potem rozłożenie na planszy."""
-    return selection_rank(board, profile)
+def _rank(board: Board, profile, stage: str = "core") -> tuple:
+    """Rdzeń ocenia wypełnialność. Gotowa plansza ocenia gęstość i logikę razem."""
+    return selection_rank(board, profile, stage)
 
 
 def _emergency_board(size: int = 12) -> Board:
