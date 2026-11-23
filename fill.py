@@ -1,0 +1,403 @@
+"""Dopełnianie wolnych komórek bez ruszania strzałek rdzenia.
+
+Każda nowa strzałka wchodzi tylko wtedy, gdy jej wyjazd jest wolny względem
+planszy już ułożonej. Dzięki temu odwrotna kolejność strzałek FILL, a potem
+rozwiązanie rdzenia, czyści całą planszę. Pełne pokrycie jest celem, nie
+warunkiem: ślepe luki i dopełnienie psujące otwarcie są odrzucane.
+"""
+
+from __future__ import annotations
+
+import random
+import time
+
+from engine import (
+    DIRECTION_DELTA,
+    DIRECTIONS,
+    OPPOSITE,
+    Arrow,
+    Board,
+    bend_count,
+    can_move,
+    exit_cells,
+    ray_cells,
+    solve_board,
+)
+
+_MAX_FILL = 16
+_BRANCH = 2
+_NODE_LIMIT = 70
+_TIME_LIMIT = 0.12
+_GROW_CAP = 48
+_NEIGHBORS = ((-1, 0), (0, 1), (1, 0), (0, -1))
+
+
+def fill_board(
+    core: Board,
+    seed: int,
+    *,
+    node_limit: int = _NODE_LIMIT,
+) -> tuple[Board, dict]:
+    """Zwraca kopię planszy z dopełnieniem oraz metryki samej fazy FILL."""
+    started = time.perf_counter()
+    rng = random.Random(f"fill-{seed}")
+    board = core.copy()
+    core_free = sum(1 for arrow in core.arrows if can_move(arrow, core))
+    best = board.copy()
+    best_key = _key(core, board)
+    rejected = 0
+    nodes = 0
+
+    def search() -> None:
+        nonlocal best, best_key, rejected, nodes
+        nodes += 1
+        if _accept(core, board, core_free):
+            key = _key(core, board)
+            if key > best_key:
+                best = board.copy()
+                best_key = key
+        fill_count = len(board.arrows) - len(core.arrows)
+        if (
+            nodes >= node_limit
+            or fill_count >= _MAX_FILL
+            or time.perf_counter() - started > _TIME_LIMIT
+        ):
+            return
+        candidates = _candidates(rng, board)
+        if len(candidates) > _BRANCH:
+            rejected += len(candidates) - _BRANCH
+        for arrow in candidates[:_BRANCH]:
+            board.add(arrow)
+            search()
+            board.remove(arrow.id)
+            if nodes >= node_limit or time.perf_counter() - started > _TIME_LIMIT:
+                return
+
+    if _has_room(board):
+        search()
+
+    if not _accept(core, best, core_free):
+        best = core.copy()
+
+    extra = len(best.occupied) - len(core.occupied)
+    area = core.size * core.size
+    return best, {
+        "added": len(best.arrows) - len(core.arrows),
+        "extra_cells": extra,
+        "cover": len(best.occupied),
+        "area": area,
+        "empty": area - len(best.occupied),
+        "rejected": rejected,
+    }
+
+
+def _has_room(board: Board) -> bool:
+    return any(len(component) >= 2 for component in _components(board))
+
+
+def _key(core: Board, board: Board) -> tuple:
+    fill = board.arrows[len(core.arrows) :]
+    curved = sum(1 for arrow in fill if bend_count(arrow.cells) > 0)
+    long = sum(1 for arrow in fill if len(arrow.cells) >= 4)
+    free = sum(1 for arrow in board.arrows if can_move(arrow, board))
+    return (len(board.occupied), long, curved, -free)
+
+
+def _accept(core: Board, board: Board, core_free: int) -> bool:
+    if not _same_core(core, board):
+        return False
+    order, error = solve_board(board)
+    if error is not None or len(order) != len(board.arrows):
+        return False
+    free = sum(1 for arrow in board.arrows if can_move(arrow, board))
+    if free < 1:
+        return False
+    fill = board.arrows[len(core.arrows) :]
+    if not fill:
+        return True
+    if free > core_free + 2:
+        return False
+    if len(fill) >= 6:
+        short = sum(1 for arrow in fill if len(arrow.cells) == 2)
+        if short * 10 > len(fill) * 7:
+            return False
+    return True
+
+
+def _same_core(core: Board, board: Board) -> bool:
+    if len(board.arrows) < len(core.arrows):
+        return False
+    for original, current in zip(core.arrows, board.arrows):
+        if original.id != current.id or original.cells != current.cells:
+            return False
+    return True
+
+
+def _candidates(rng: random.Random, board: Board) -> list[Arrow]:
+    found: list[Arrow] = []
+    seen: set[tuple[tuple[int, int], ...]] = set()
+    next_id = 1 + max((arrow.id for arrow in board.arrows), default=0)
+
+    def take(cells: tuple[tuple[int, int], ...] | None) -> None:
+        nonlocal next_id
+        if cells is None or cells in seen:
+            return
+        arrow = Arrow(next_id, cells)
+        if not _placeable(arrow, board):
+            return
+        seen.add(cells)
+        found.append(arrow)
+        next_id += 1
+
+    free_arrows = [arrow for arrow in board.arrows if can_move(arrow, board)]
+    rng.shuffle(free_arrows)
+    for target in free_arrows[:4]:
+        pivots = [cell for cell in exit_cells(target, board.size) if cell not in board.occupied]
+        rng.shuffle(pivots)
+        for pivot in pivots[:2]:
+            directions = list(DIRECTIONS)
+            rng.shuffle(directions)
+            for direction in directions[:2]:
+                take(_grow(rng, board, pivot, direction))
+                if len(found) >= 8:
+                    return _ranked(found, board)
+
+    heads = _chainable_heads(board)
+    rng.shuffle(heads)
+    for head, direction in heads[:6]:
+        take(_grow(rng, board, head, direction))
+        if len(found) >= 8:
+            break
+    return _ranked(found, board)
+
+
+def _ranked(arrows: list[Arrow], board: Board) -> list[Arrow]:
+    base_holes = _singletons(board, ())
+    scored = [(_score(arrow, board, base_holes), arrow.cells, arrow) for arrow in arrows]
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [arrow for _score_value, _cells, arrow in scored]
+
+
+def _score(arrow: Arrow, board: Board, base_holes: int) -> int:
+    covered = set(arrow.cells)
+    fresh = 0
+    for other in board.arrows:
+        if not can_move(other, board):
+            continue
+        for cell in exit_cells(other, board.size):
+            if cell in covered:
+                fresh += 1
+                break
+    holes = _singletons(board, arrow.cells) - base_holes
+    room = 0
+    for cell in exit_cells(arrow, board.size):
+        if cell not in board.occupied and cell not in covered:
+            room += 1
+            if room >= 3:
+                break
+    bends = bend_count(arrow.cells)
+    length = len(arrow.cells)
+    score = fresh * 8 + length * 2 + bends * 2 + min(room, 3) * 2 - max(0, holes) * 5
+    if length == 2 and fresh == 0:
+        score -= 4
+    if room == 0 and fresh == 0:
+        score -= 6
+    return score
+
+
+def _chainable_heads(board: Board) -> list[tuple[tuple[int, int], str]]:
+    heads: list[tuple[tuple[int, int], str]] = []
+    for component in _components(board)[:2]:
+        if len(component) < 4:
+            continue
+        area = set(component)
+        for cell in component:
+            row, col = cell
+            for direction, (d_row, d_col) in DIRECTION_DELTA.items():
+                hit = 0
+                next_row = row + d_row
+                next_col = col + d_col
+                while (next_row, next_col) in area and hit < 3:
+                    hit += 1
+                    next_row += d_row
+                    next_col += d_col
+                if hit >= 2 and _step_inside((row, col), OPPOSITE[direction], board, area):
+                    heads.append(((row, col), direction))
+    return heads
+
+
+def _step_inside(
+    head: tuple[int, int],
+    direction: str,
+    board: Board,
+    area: set[tuple[int, int]],
+) -> bool:
+    d_row, d_col = DIRECTION_DELTA[direction]
+    behind = (head[0] + d_row, head[1] + d_col)
+    return behind in area and behind not in board.occupied
+
+
+def _grow(
+    rng: random.Random,
+    board: Board,
+    head: tuple[int, int],
+    direction: str,
+) -> tuple[tuple[int, int], ...] | None:
+    if head in board.occupied or not _inside(head, board.size):
+        return None
+    if not _step_inside(head, OPPOSITE[direction], board, _all_cells(board.size)):
+        return None
+    local = random.Random(rng.randrange(1 << 30))
+    want_bend = local.random() < 0.42
+    lengths = [8, 7, 6, 5, 4, 3, 2]
+    local.shuffle(lengths)
+    forbidden = set(ray_cells(head[0], head[1], direction, board.size))
+    for length in lengths:
+        cells = _grow_exact(local, board, head, direction, length, want_bend, forbidden)
+        if cells is None and want_bend:
+            cells = _grow_exact(local, board, head, direction, length, False, forbidden)
+        if cells is not None:
+            return cells
+    return None
+
+
+def _grow_exact(
+    rng: random.Random,
+    board: Board,
+    head: tuple[int, int],
+    direction: str,
+    length: int,
+    want_bend: bool,
+    forbidden: set[tuple[int, int]],
+) -> tuple[tuple[int, int], ...] | None:
+    path = [head]
+    nodes = 0
+
+    def options() -> list[str]:
+        if len(path) == 1:
+            return [OPPOSITE[direction]]
+        arrived = _step_name(path[-2], path[-1])
+        turns = [
+            name
+            for name in DIRECTIONS
+            if name != arrived and name != OPPOSITE[arrived]
+        ]
+        if not want_bend:
+            return [arrived]
+        rng.shuffle(turns)
+        if turns and rng.random() < 0.5:
+            return turns + [arrived]
+        return [arrived] + turns
+
+    def dfs() -> bool:
+        nonlocal nodes
+        nodes += 1
+        if nodes > _GROW_CAP:
+            return False
+        if len(path) == length:
+            return True
+        for step in options():
+            d_row, d_col = DIRECTION_DELTA[step]
+            nxt = (path[-1][0] + d_row, path[-1][1] + d_col)
+            if not _inside(nxt, board.size):
+                continue
+            if nxt in board.occupied or nxt in forbidden or nxt in path:
+                continue
+            path.append(nxt)
+            if dfs():
+                return True
+            path.pop()
+        return False
+
+    if not dfs():
+        return None
+    if want_bend and bend_count(path) == 0:
+        return None
+    path.reverse()
+    return tuple(path)
+
+
+def _placeable(arrow: Arrow, board: Board) -> bool:
+    seen: set[tuple[int, int]] = set()
+    for cell in arrow.cells:
+        if not _inside(cell, board.size) or cell in seen or cell in board.occupied:
+            return False
+        seen.add(cell)
+    if len(arrow.cells) < 2 or len(arrow.cells) > 8:
+        return False
+    if seen & set(exit_cells(arrow, board.size)):
+        return False
+    return can_move(arrow, board)
+
+
+def _components(board: Board) -> list[list[tuple[int, int]]]:
+    seen: set[tuple[int, int]] = set()
+    components: list[list[tuple[int, int]]] = []
+    for row in range(board.size):
+        for col in range(board.size):
+            start = (row, col)
+            if start in board.occupied or start in seen:
+                continue
+            stack = [start]
+            seen.add(start)
+            component: list[tuple[int, int]] = []
+            while stack:
+                cell = stack.pop()
+                component.append(cell)
+                for d_row, d_col in _NEIGHBORS:
+                    nxt = (cell[0] + d_row, cell[1] + d_col)
+                    if not _inside(nxt, board.size) or nxt in board.occupied or nxt in seen:
+                        continue
+                    seen.add(nxt)
+                    stack.append(nxt)
+            components.append(component)
+    components.sort(key=len, reverse=True)
+    return components
+
+
+def _singletons(board: Board, extra: tuple[tuple[int, int], ...] | set[tuple[int, int]]) -> int:
+    blocked = set(extra)
+    seen: set[tuple[int, int]] = set()
+    singles = 0
+    for row in range(board.size):
+        for col in range(board.size):
+            start = (row, col)
+            if start in seen or start in board.occupied or start in blocked:
+                continue
+            stack = [start]
+            seen.add(start)
+            count = 0
+            while stack:
+                count += 1
+                cell = stack.pop()
+                for d_row, d_col in _NEIGHBORS:
+                    nxt = (cell[0] + d_row, cell[1] + d_col)
+                    if (
+                        not _inside(nxt, board.size)
+                        or nxt in seen
+                        or nxt in board.occupied
+                        or nxt in blocked
+                    ):
+                        continue
+                    seen.add(nxt)
+                    stack.append(nxt)
+            if count == 1:
+                singles += 1
+    return singles
+
+
+def _all_cells(size: int) -> set[tuple[int, int]]:
+    return {(row, col) for row in range(size) for col in range(size)}
+
+
+def _inside(cell: tuple[int, int], size: int) -> bool:
+    row, col = cell
+    return 0 <= row < size and 0 <= col < size
+
+
+def _step_name(start: tuple[int, int], end: tuple[int, int]) -> str:
+    delta = (end[0] - start[0], end[1] - start[1])
+    for name, step in DIRECTION_DELTA.items():
+        if step == delta:
+            return name
+    raise ValueError(delta)
