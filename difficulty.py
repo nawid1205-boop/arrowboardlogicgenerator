@@ -20,20 +20,19 @@ LABELS = {
     5: "Ekspercka",
 }
 
-FIT_WEIGHTS = {
-    "free_ratio": 0.28,
-    "depth": 0.24,
-    "blocks_per_arrow": 0.16,
-    "first_share": 0.12,
-    "visual_search": 0.12,
-    "arrows": 0.08,
+LOGIC_FIT_WEIGHTS = {
+    "free_ratio": 0.24,
+    "depth": 0.34,
+    "joins": 0.22,
+    "choices": 0.14,
+    "arrows": 0.06,
 }
 
 LOGIC_DIFFICULTY_WEIGHTS = {
-    "opening": 0.34,
-    "depth": 0.30,
-    "blocks": 0.22,
-    "release": 0.14,
+    "opening": 0.24,
+    "depth": 0.36,
+    "joins": 0.22,
+    "search": 0.18,
 }
 
 
@@ -48,6 +47,9 @@ class DifficultyProfile:
     blocks_per_arrow: tuple[float, float]
     first_share: tuple[float, float]
     visual_search: tuple[float, float]
+    join_ratio: tuple[float, float]
+    choices: tuple[float, float]
+    tip_weight: int
     min_spatial: float
     blocking_bias: float
     prefer_block: float
@@ -87,6 +89,9 @@ PROFILES = {
         blocks_per_arrow=(0.20, 0.80),
         first_share=(0.42, 0.75),
         visual_search=(0.05, 0.30),
+        join_ratio=(0.00, 0.25),
+        choices=(2.0, 4.2),
+        tip_weight=0,
         min_spatial=0.40,
         blocking_bias=0.20,
         prefer_block=0.15,
@@ -120,6 +125,9 @@ PROFILES = {
         blocks_per_arrow=(0.65, 1.25),
         first_share=(0.28, 0.50),
         visual_search=(0.15, 0.42),
+        join_ratio=(0.05, 0.30),
+        choices=(1.6, 3.4),
+        tip_weight=0,
         min_spatial=0.38,
         blocking_bias=0.48,
         prefer_block=0.50,
@@ -153,6 +161,9 @@ PROFILES = {
         blocks_per_arrow=(1.05, 1.85),
         first_share=(0.16, 0.40),
         visual_search=(0.20, 0.55),
+        join_ratio=(0.18, 0.48),
+        choices=(1.4, 2.8),
+        tip_weight=0,
         min_spatial=0.30,
         blocking_bias=0.78,
         prefer_block=0.90,
@@ -180,19 +191,22 @@ PROFILES = {
         level=4,
         label=LABELS[4],
         core_arrows=(13, 16),
-        total_arrows=(14, 18),
-        free_ratio=(0.18, 0.32),
-        depth=(8, 11),
+        total_arrows=(13, 19),
+        free_ratio=(0.12, 0.30),
+        depth=(9, 13),
         blocks_per_arrow=(1.15, 1.80),
-        first_share=(0.16, 0.32),
-        visual_search=(0.28, 0.55),
+        first_share=(0.12, 0.26),
+        visual_search=(0.28, 0.52),
+        join_ratio=(0.32, 0.62),
+        choices=(1.05, 2.00),
+        tip_weight=8,
         min_spatial=0.28,
-        blocking_bias=0.76,
-        prefer_block=0.86,
-        block_weight=5,
-        max_open=8,
-        turn_probability=0.26,
-        archetype_weights=(3, 2, 4, 3),
+        blocking_bias=0.88,
+        prefer_block=0.94,
+        block_weight=6,
+        max_open=5,
+        turn_probability=0.30,
+        archetype_weights=(2, 2, 4, 4),
         long_length=8,
         spread_bonus=1,
         stagnant=28,
@@ -212,20 +226,23 @@ PROFILES = {
     5: _profile(
         level=5,
         label=LABELS[5],
-        core_arrows=(14, 17),
-        total_arrows=(14, 19),
-        free_ratio=(0.16, 0.28),
-        depth=(8, 13),
-        blocks_per_arrow=(1.25, 1.95),
-        first_share=(0.12, 0.28),
-        visual_search=(0.34, 0.64),
+        core_arrows=(14, 16),
+        total_arrows=(13, 19),
+        free_ratio=(0.06, 0.20),
+        depth=(10, 16),
+        blocks_per_arrow=(1.20, 1.90),
+        first_share=(0.08, 0.20),
+        visual_search=(0.30, 0.55),
+        join_ratio=(0.40, 0.70),
+        choices=(1.00, 1.70),
+        tip_weight=16,
         min_spatial=0.28,
-        blocking_bias=0.90,
-        prefer_block=0.95,
-        block_weight=7,
-        max_open=8,
-        turn_probability=0.34,
-        archetype_weights=(2, 2, 4, 5),
+        blocking_bias=0.93,
+        prefer_block=0.97,
+        block_weight=6,
+        max_open=4,
+        turn_probability=0.30,
+        archetype_weights=(2, 2, 4, 4),
         long_length=8,
         spread_bonus=1,
         stagnant=30,
@@ -274,6 +291,8 @@ def analyze_difficulty(board: Board) -> dict:
         "curve": curve,
         "stages": logic["stages"],
         "first_share": (curve[0] / denom) if curve else 0.0,
+        "mean_choices": (sum(curve) / len(curve)) if curve else 0.0,
+        "join_ratio": logic["joins"] / denom,
         "curved": sum(1 for value in bends if value),
         "straight": arrows - sum(1 for value in bends if value),
         "mean_bends": (sum(bends) / denom) if arrows else 0.0,
@@ -320,35 +339,38 @@ def visual_search_complexity(board: Board) -> float:
 
 
 def logic_difficulty_score(report: dict) -> float:
-    """0 to plansza luźna, 1 to długa sieć blokad. Bez oceny ładności."""
+    """Trudność grafu. Liczba etapów i liczba zakrętów nie podbijają wyniku."""
     parts = {
         "opening": _clamp(1.0 - report["free_ratio"] / 0.65),
-        "depth": _clamp((report["depth"] - 1) / 14.0),
-        "blocks": _clamp(report["blocks_per_arrow"] / 2.2),
-        "release": _clamp(1.0 - report["first_share"] / 0.70),
+        "depth": _clamp((report["depth"] - 1) / 12.0),
+        "joins": _clamp(report["join_ratio"] / 0.55),
+        "search": _clamp((3.0 - report["mean_choices"]) / 2.2),
     }
     return _weighted(parts, LOGIC_DIFFICULTY_WEIGHTS)
 
 
 def profile_fit(report: dict, profile: DifficultyProfile) -> float:
-    """1 oznacza trafienie we wszystkie pasma profilu."""
+    """1 oznacza środek profilu. Skraj pasma jest gorszy niż środek."""
     parts = {
-        "free_ratio": range_fit(report["free_ratio"], *profile.free_ratio),
-        "depth": range_fit(report["depth"], *profile.depth),
-        "blocks_per_arrow": range_fit(report["blocks_per_arrow"], *profile.blocks_per_arrow),
-        "first_share": range_fit(report["first_share"], *profile.first_share),
-        "visual_search": range_fit(report["visual_search"], *profile.visual_search),
-        "arrows": range_fit(report["arrows"], *profile.total_arrows),
+        "free_ratio": center_fit(report["free_ratio"], *profile.free_ratio),
+        "depth": center_fit(report["depth"], *profile.depth),
+        "joins": center_fit(report["join_ratio"], *profile.join_ratio),
+        "choices": center_fit(report["mean_choices"], *profile.choices),
+        "arrows": center_fit(report["arrows"], *profile.total_arrows),
     }
-    return _weighted(parts, FIT_WEIGHTS)
+    return _weighted(parts, LOGIC_FIT_WEIGHTS)
+
+
+def visual_fit(report: dict, profile: DifficultyProfile) -> float:
+    return center_fit(report["visual_search"], *profile.visual_search)
 
 
 def outside_targets(report: dict, profile: DifficultyProfile) -> list[str]:
     checks = {
         "free_ratio": range_fit(report["free_ratio"], *profile.free_ratio),
         "depth": range_fit(report["depth"], *profile.depth),
-        "blocks_per_arrow": range_fit(report["blocks_per_arrow"], *profile.blocks_per_arrow),
-        "first_share": range_fit(report["first_share"], *profile.first_share),
+        "joins": range_fit(report["join_ratio"], *profile.join_ratio),
+        "choices": range_fit(report["mean_choices"], *profile.choices),
         "visual_search": range_fit(report["visual_search"], *profile.visual_search),
         "arrows": range_fit(report["arrows"], *profile.total_arrows),
     }
@@ -356,14 +378,11 @@ def outside_targets(report: dict, profile: DifficultyProfile) -> list[str]:
 
 
 def selection_rank(board: Board, profile: DifficultyProfile | int | None = None) -> tuple:
-    """Najpierw zgodność z poziomem, potem rozłożenie, potem czytelność kształtu."""
+    """Najpierw odległość logiczna od profilu, potem rozłożenie, na końcu pokrycie."""
     if not isinstance(profile, DifficultyProfile):
         profile = profile_for(3 if profile is None else profile)
     report = analyze_difficulty(board)
-    fit = profile_fit(report, profile)
-    spatial = report["spatial"]
-    adjusted = fit * (0.80 + 0.20 * spatial)
-    readable = analyze_visual(board)["parts"]["shape"]
+    logic = profile_fit(report, profile)
     if profile.level <= 2:
         cover = -len(board.occupied)
     elif profile.level >= 4:
@@ -371,12 +390,19 @@ def selection_rank(board: Board, profile: DifficultyProfile | int | None = None)
     else:
         cover = 0
     return (
-        int(adjusted * 20),
-        int(spatial * 20),
-        int(readable * 20),
-        round(adjusted, 5),
+        int(logic * 40),
+        int(report["spatial"] * 20),
+        int(visual_fit(report, profile) * 20),
+        round(logic, 5),
         cover,
     )
+
+
+def center_fit(value: float, low: float, high: float) -> float:
+    mid = (low + high) / 2.0
+    half = max((high - low) / 2.0, 1e-6)
+    deviation = abs(value - mid) / half
+    return 1.0 / (1.0 + deviation)
 
 
 def range_fit(value: float, low: float, high: float) -> float:

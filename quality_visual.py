@@ -60,7 +60,7 @@ def _evenness(counts: list[int]) -> float:
         return 0.0
     mean = total / 4
     spread = (max(counts) - min(counts)) / mean
-    return _clamp(1.0 - spread / 4.0)
+    return _clamp(1.0 - spread / 3.0)
 
 
 def spatial_balance(board: Board) -> dict:
@@ -89,22 +89,39 @@ def spatial_balance(board: Board) -> dict:
     local = _clamp(1.0 - _clump_ratio(board))
     largest = _largest_empty(board)
     hole_share = largest / area
-    openness = 1.0 if used >= 0.75 else _clamp(1.0 - max(0.0, hole_share - 0.55) / 0.45)
+    void = hole_share * (1.0 - even_cells)
+    openness = _clamp(1.0 - void / 0.50)
+    spread = _head_spread(board)
     parts = {
         "quadrants": even_cells,
         "heads": even_heads,
         "coverage": used,
         "local": local,
         "openness": openness,
+        "spread": spread,
     }
     score = (
-        0.30 * even_cells
-        + 0.20 * even_heads
-        + 0.20 * used
-        + 0.15 * local
-        + 0.15 * openness
+        0.26 * even_cells
+        + 0.18 * even_heads
+        + 0.14 * used
+        + 0.14 * local
+        + 0.14 * openness
+        + 0.14 * spread
     )
     return {"score": _clamp(score), "parts": parts, "largest_empty": largest}
+
+
+def _head_spread(board: Board) -> float:
+    heads = [arrow.head for arrow in board.arrows]
+    if len(heads) < 2:
+        return 1.0
+    total = 0.0
+    pairs = 0
+    for index, head in enumerate(heads):
+        for other in heads[index + 1 :]:
+            total += abs(head[0] - other[0]) + abs(head[1] - other[1])
+            pairs += 1
+    return _clamp((total / pairs) / (board.size * 0.75))
 
 
 def _clump_ratio(board: Board) -> float:

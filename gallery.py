@@ -10,7 +10,7 @@ from generator import build_puzzle
 
 CELL = 18
 PAD = 16
-SEEDS = (1, 2, 3, 4, 5)
+SEEDS = tuple(range(1, 11))
 
 
 def _points(cells: tuple[tuple[int, int], ...]) -> str:
@@ -56,6 +56,8 @@ def _board(puzzle, level: int, seed: int) -> str:
         f"strzałki {stats['arrows']}<br>"
         f"ruchy {stats['free']}<br>"
         f"głębokość {stats['depth']}<br>"
+        f"złączenia {stats['joins']}<br>"
+        f"wybory {stats['mean_choices']:.2f}<br>"
         f"logic {stats['logic_difficulty']:.2f}<br>"
         f"spatial {stats['spatial']:.2f}"
     )

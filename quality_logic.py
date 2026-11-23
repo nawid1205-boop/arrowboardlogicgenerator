@@ -93,6 +93,59 @@ def _dependency_graph(
     return blockers, outgoing
 
 
+def extendable_tip(board: Board) -> int | None:
+    """Wolna strzałka z najdłuższym łańcuchem za sobą i wolnym wyjazdem na planszy."""
+    blockers, outgoing = _dependency_graph(board)
+    if not blockers:
+        return None
+    depths = _depth_map(blockers)
+    best_id = None
+    best_score = -1
+    for arrow in board.arrows:
+        if blockers[arrow.id]:
+            continue
+        room = sum(1 for cell in exit_cells(arrow, board.size) if cell not in board.occupied)
+        if room <= 0:
+            continue
+        behind = 1
+        stack = list(outgoing[arrow.id])
+        seen: set[int] = set()
+        while stack:
+            nxt = stack.pop()
+            if nxt in seen:
+                continue
+            seen.add(nxt)
+            behind = max(behind, depths.get(nxt, 1))
+            stack.extend(outgoing.get(nxt, ()))
+        score = behind * 10 + room
+        if score > best_score:
+            best_score = score
+            best_id = arrow.id
+    return best_id
+
+
+def _depth_map(blockers: dict[int, list[int]]) -> dict[int, int]:
+    memo: dict[int, int] = {}
+    visiting: set[int] = set()
+
+    def depth(arrow_id: int) -> int:
+        if arrow_id in memo:
+            return memo[arrow_id]
+        if arrow_id in visiting:
+            return 1
+        visiting.add(arrow_id)
+        best = 1
+        for blocker_id in blockers.get(arrow_id, ()):
+            best = max(best, 1 + depth(blocker_id))
+        visiting.remove(arrow_id)
+        memo[arrow_id] = best
+        return best
+
+    for arrow_id in blockers:
+        depth(arrow_id)
+    return memo
+
+
 def _chain_depth(blockers: dict[int, list[int]]) -> int:
     memo: dict[int, int] = {}
     visiting: set[int] = set()

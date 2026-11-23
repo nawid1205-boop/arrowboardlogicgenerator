@@ -51,7 +51,7 @@ def fill_board(
         board = core.copy()
         placed = 0
         while placed < budget:
-            candidates = _candidates(local, board)
+            candidates = _candidates(local, board, profile)
             if not candidates:
                 break
             chosen = _chain_candidate(board, candidates, core_free, profile.free_slack)
@@ -98,7 +98,8 @@ def _fill_key(board: Board, profile, core: Board) -> tuple:
     if _open_rows(core) < 3:
         return rank
     extra = len(board.occupied) - len(core.occupied)
-    return (rank[0], extra, *rank[1:])
+    band = round(rank[3] * 20)
+    return (band, extra, *rank[1:])
 
 
 def _open_rows(board: Board) -> int:
@@ -167,7 +168,7 @@ def _same_core(core: Board, board: Board) -> bool:
     return True
 
 
-def _candidates(rng: random.Random, board: Board) -> list[Arrow]:
+def _candidates(rng: random.Random, board: Board, profile=None) -> list[Arrow]:
     found: list[Arrow] = []
     seen: set[tuple[tuple[int, int], ...]] = set()
     next_id = 1 + max((arrow.id for arrow in board.arrows), default=0)
@@ -194,7 +195,7 @@ def _candidates(rng: random.Random, board: Board) -> list[Arrow]:
             for direction in directions[:2]:
                 take(_grow(rng, board, pivot, direction))
                 if len(found) >= 8:
-                    return _ranked(found, board)
+                    return _ranked(found, board, profile)
 
     heads = _chainable_heads(board)
     rng.shuffle(heads)
@@ -202,17 +203,17 @@ def _candidates(rng: random.Random, board: Board) -> list[Arrow]:
         take(_grow(rng, board, head, direction))
         if len(found) >= 8:
             break
-    return _ranked(found, board)
+    return _ranked(found, board, profile)
 
 
-def _ranked(arrows: list[Arrow], board: Board) -> list[Arrow]:
+def _ranked(arrows: list[Arrow], board: Board, profile=None) -> list[Arrow]:
     base_holes = _singletons(board, ())
-    scored = [(_score(arrow, board, base_holes), arrow.cells, arrow) for arrow in arrows]
+    scored = [(_score(arrow, board, base_holes, profile), arrow.cells, arrow) for arrow in arrows]
     scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
     return [arrow for _score_value, _cells, arrow in scored]
 
 
-def _score(arrow: Arrow, board: Board, base_holes: int) -> int:
+def _score(arrow: Arrow, board: Board, base_holes: int, profile=None) -> int:
     covered = set(arrow.cells)
     fresh = 0
     for other in board.arrows:
@@ -235,6 +236,15 @@ def _score(arrow: Arrow, board: Board, base_holes: int) -> int:
     bend_fit = 1 if bends == 1 else 0
     twist_penalty = 3 if bends >= 3 else 0
     score = fresh * 8 + length_fit * 2 + bend_fit - twist_penalty - max(0, holes) * 4
+    if profile is not None and profile.tip_weight >= 6 and board.occupied:
+        counts = [0, 0, 0, 0]
+        mid = board.size / 2
+        for row, col in board.occupied:
+            counts[(0 if row < mid else 2) + (0 if col < mid else 1)] += 1
+        head_row, head_col = arrow.head
+        quadrant = (0 if head_row < mid else 2) + (0 if head_col < mid else 1)
+        if counts[quadrant] <= min(counts):
+            score += 2
     if length == 2 and fresh == 0:
         score -= 4
     if room == 0 and fresh == 0:

@@ -38,7 +38,7 @@ from difficulty import (
     selection_rank,
 )
 from fill import fill_board
-from quality_logic import analyze_logic
+from quality_logic import analyze_logic, extendable_tip
 from quality_visual import analyze_visual
 
 # Diagnostyka: False zostawia sam rdzeń, True pokazuje rdzeń i dopełnienie.
@@ -195,7 +195,7 @@ def _attach_difficulty(stats: dict, board: Board, profile, hard_miss: bool) -> N
     stats["label"] = profile.label
     stats["fit"] = fit
     stats["deviation"] = 1.0 - fit
-    stats["profile_miss"] = hard_miss or fit < 0.70
+    stats["profile_miss"] = hard_miss or fit < 0.58
     stats["outside"] = outside_targets(report, profile)
     stats["free_ratio"] = report["free_ratio"]
     stats["logic_difficulty"] = report["logic_difficulty"]
@@ -203,6 +203,8 @@ def _attach_difficulty(stats: dict, board: Board, profile, hard_miss: bool) -> N
     stats["visual_search"] = report["visual_search"]
     stats["blocks_per_arrow"] = report["blocks_per_arrow"]
     stats["first_share"] = report["first_share"]
+    stats["mean_choices"] = report["mean_choices"]
+    stats["join_ratio"] = report["join_ratio"]
     stats["largest_empty"] = report["largest_empty"]
     stats["mean_bends"] = report["mean_bends"]
     stats["mean_length"] = report["mean_length"]
@@ -263,6 +265,8 @@ def metrics(board: Board) -> dict:
         "logic_parts": logic["parts"],
         "visual_parts": visual["parts"],
         "isolated": logic["isolated"],
+        "joins": logic["joins"],
+        "splits": logic["splits"],
     }
 
 
@@ -323,15 +327,19 @@ def _build_once(rng: random.Random, size: int, target: int, profile) -> Board:
 def _pick_candidate(rng: random.Random, board: Board, profile) -> Arrow | None:
     pool: list[Arrow] = []
     seen: set[tuple[tuple[int, int], ...]] = set()
+    tip_id = extendable_tip(board) if board.arrows and profile.tip_weight >= 6 else None
+    commit_tip = tip_id is not None and rng.random() < min(1.0, profile.tip_weight / 16)
     for _ in range(_CANDIDATES):
         if board.arrows and rng.random() < profile.blocking_bias:
-            arrow = _blocking_candidate(rng, board, profile)
+            arrow = _blocking_candidate(rng, board, profile, tip_id)
         else:
             arrow = None
         if arrow is None:
             arrow = _random_candidate(rng, board, profile)
         if arrow is None or arrow.cells in seen:
             continue
+        if commit_tip and _covers_target(arrow, board, tip_id):
+            return arrow
         seen.add(arrow.cells)
         pool.append(arrow)
     if not pool:
@@ -341,11 +349,11 @@ def _pick_candidate(rng: random.Random, board: Board, profile) -> Arrow | None:
         blockers = [arrow for arrow in pool if _new_blocks(arrow, board) > 0]
         if blockers:
             pool = blockers
-    weights = [_weight(arrow, board, profile) for arrow in pool]
+    weights = [_weight(arrow, board, profile, tip_id) for arrow in pool]
     return rng.choices(pool, weights=weights, k=1)[0]
 
 
-def _weight(arrow: Arrow, board: Board, profile) -> int:
+def _weight(arrow: Arrow, board: Board, profile, tip_id: int | None = None) -> int:
     fresh = _new_blocks(arrow, board)
     bends = bend_count(arrow.cells)
     existing_bends = sum(1 for other in board.arrows if bend_count(other.cells) > 0)
@@ -362,6 +370,7 @@ def _weight(arrow: Arrow, board: Board, profile) -> int:
         + _block_count(arrow, board)
         + diversity
         + _spread_bonus(arrow, board, profile.spread_bonus)
+        + (profile.tip_weight if tip_id is not None and _covers_target(arrow, board, tip_id) else 0)
     )
 
 
@@ -388,7 +397,87 @@ def _quadrant_index(row: int, col: int, size: int) -> int:
     return (0 if row < mid else 2) + (0 if col < mid else 1)
 
 
-def _blocking_candidate(rng: random.Random, board: Board, profile) -> Arrow | None:
+def _quadrant_load(
+    cell: tuple[int, int],
+    direction: str,
+    size: int,
+    loads: list[int],
+) -> int:
+    d_row, d_col = DIRECTION_DELTA[direction]
+    nxt = (cell[0] + d_row, cell[1] + d_col)
+    if not _inside(nxt, size):
+        return 99
+    return loads[_quadrant_index(nxt[0], nxt[1], size)]
+
+
+def _covers_target(arrow: Arrow, board: Board, target_id: int) -> bool:
+    target = board.arrow_by_id(target_id)
+    if target is None:
+        return False
+    covered = set(arrow.cells)
+    return any(cell in covered for cell in exit_cells(target, board.size))
+
+
+def _block_target(
+    rng: random.Random,
+    board: Board,
+    target: Arrow,
+    profile,
+    prefer_room: bool,
+) -> Arrow | None:
+    free = [cell for cell in exit_cells(target, board.size) if cell not in board.occupied]
+    if not free:
+        return None
+    if not prefer_room:
+        rng.shuffle(free)
+        pivots = free[:4]
+    else:
+        pivots = free
+    for pivot in pivots:
+        directions = list(DIRECTIONS)
+        rng.shuffle(directions)
+        if prefer_room:
+            directions.sort(key=lambda name: _direction_rank(pivot, name, board))
+        attempts = ((4, False, 0.0), (3, False, 0.0), (2, False, 0.0)) if prefer_room else (None,)
+        for direction in directions:
+            for forced in attempts:
+                arrow = _arrow_from_head(rng, board, pivot, direction, profile, forced)
+                if arrow is not None and _block_count(arrow, board) > 0:
+                    return arrow
+    return None
+
+
+def _direction_rank(cell: tuple[int, int], direction: str, board: Board) -> tuple[int, int, int, int]:
+    behind = 0 if _step_back_open(cell, direction, board) else 1
+    room = len(ray_cells(cell[0], cell[1], direction, board.size))
+    d_row, d_col = DIRECTION_DELTA[direction]
+    nxt = (cell[0] + d_row, cell[1] + d_col)
+    if not _inside(nxt, board.size):
+        load = 99
+    else:
+        counts = _quadrant_counts(board)
+        load = counts[_quadrant_index(nxt[0], nxt[1], board.size)]
+    return (behind, 0 if room >= 2 else 1, load, -room)
+
+
+def _step_back_open(cell: tuple[int, int], direction: str, board: Board) -> bool:
+    d_row, d_col = DIRECTION_DELTA[OPPOSITE[direction]]
+    behind = (cell[0] + d_row, cell[1] + d_col)
+    return _inside(behind, board.size) and behind not in board.occupied
+
+
+def _blocking_candidate(
+    rng: random.Random,
+    board: Board,
+    profile,
+    tip_id: int | None = None,
+) -> Arrow | None:
+    if tip_id is not None:
+        tip = board.arrow_by_id(tip_id)
+        if tip is not None:
+            forced = _block_target(rng, board, tip, profile, True)
+            if forced is not None:
+                return forced
     targets = list(board.arrows)
     rng.shuffle(targets)
     for target in targets[:5]:
@@ -428,10 +517,14 @@ def _arrow_from_head(
     head: tuple[int, int],
     direction: str,
     profile,
+    forced: tuple[int, bool, float] | None = None,
 ) -> Arrow | None:
     if not _step_back_inside(head, direction, board.size):
         return None
-    length, want_bend, turn_p = _archetype(rng, profile)
+    if forced is None:
+        length, want_bend, turn_p = _archetype(rng, profile)
+    else:
+        length, want_bend, turn_p = forced
     forbidden = set(ray_cells(head[0], head[1], direction, board.size))
     cells = _grow_backward(
         rng,
@@ -443,6 +536,7 @@ def _arrow_from_head(
         length,
         want_bend,
         turn_p,
+        profile.tip_weight >= 8,
     )
     if cells is None:
         return None
@@ -500,10 +594,15 @@ def _grow_backward(
     length: int,
     want_bend: bool,
     turn_p: float,
+    spread: bool = False,
 ) -> tuple[tuple[int, int], ...] | None:
     """Buduje ciało wstecz od grotu i zwraca komórki od ogona do grotu."""
     path = [head]
     nodes = 0
+    loads = [0, 0, 0, 0]
+    if spread:
+        for row, col in occupied:
+            loads[_quadrant_index(row, col, size)] += 1
 
     def options() -> list[str]:
         if len(path) == 1:
@@ -517,6 +616,9 @@ def _grow_backward(
         if not want_bend:
             return [arrived]
         rng.shuffle(turns)
+        if spread and turns:
+            here = path[-1]
+            turns.sort(key=lambda name: _quadrant_load(here, name, size, loads))
         if turns and rng.random() < turn_p:
             return turns + [arrived]
         return [arrived] + turns
