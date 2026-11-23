@@ -30,8 +30,15 @@ from engine import (
     ray_cells,
     solve_board,
 )
+from difficulty import (
+    analyze_difficulty,
+    outside_targets,
+    profile_fit,
+    profile_for,
+    selection_rank,
+)
 from fill import fill_board
-from quality_logic import analyze_logic, selection_key
+from quality_logic import analyze_logic
 from quality_visual import analyze_visual
 
 # Diagnostyka: False zostawia sam rdzeń, True pokazuje rdzeń i dopełnienie.
@@ -49,72 +56,178 @@ _CANDIDATES = 7
 _GROW_NODE_CAP = 500
 
 
-def generate_board(seed: int, size: int = 12) -> Board:
+def generate_board(seed: int, size: int = 12, difficulty: int = 3) -> Board:
     """Zwraca planszę pokazywaną w grze."""
-    return build_puzzle(seed, size).final
+    return build_puzzle(seed, size, difficulty=difficulty).final
 
 
-def generate_core(seed: int, size: int = 12) -> Board:
-    """Buduje kilka rdzeni i zostawia najlepszy pod względem jakości."""
-    return generate_core_report(seed, size).board
+def generate_core(seed: int, size: int = 12, difficulty: int = 3) -> Board:
+    """Buduje kilka rdzeni i zostawia ten, którego pełna plansza pasuje do poziomu."""
+    return build_puzzle(seed, size, report=False, difficulty=difficulty).core
 
 
-def generate_core_report(seed: int, size: int = 12, trials: int | None = None) -> CoreReport:
+def generate_core_report(
+    seed: int,
+    size: int = 12,
+    trials: int | None = None,
+    difficulty: int = 3,
+) -> CoreReport:
     """Wybiera rdzeń tylko spośród kandydatów spełniających twarde warunki."""
-    trial_count = _MAX_TRIALS if trials is None else trials
-    rng = random.Random(seed)
-    pool: list[Board] = []
-    rejected = 0
-    for _ in range(trial_count):
-        target = rng.randint(MIN_ARROWS, MAX_ARROWS)
-        board = _build_once(rng, size, target)
-        if not _verified(board) or not _acceptable(board):
-            rejected += 1
-            continue
-        pool.append(board)
-    if not pool:
-        emergency = _emergency_board(size)
-        if not _verified(emergency) or not _acceptable(emergency):
-            raise RuntimeError(f"Nie udało się zbudować planszy dla seed={seed}")
-        return CoreReport(emergency, True, trial_count, rejected)
-    best = max(pool, key=_rank)
-    return CoreReport(best, False, trial_count, rejected)
+    profile = profile_for(difficulty)
+    pool, rejected, trial_count, emergency, hard_miss = _collect(seed, size, difficulty, trials)
+    if emergency is not None:
+        return CoreReport(emergency, True, trial_count, rejected, difficulty=profile.level)
+    best = max(pool, key=lambda board: _rank(board, profile))
+    fit, deviation, profile_miss = _fit_of(best, profile, hard_miss)
+    return CoreReport(
+        best,
+        False,
+        trial_count,
+        rejected,
+        fit=fit,
+        deviation=deviation,
+        profile_miss=profile_miss,
+        difficulty=profile.level,
+    )
 
 
-def build_puzzle(seed: int, size: int = 12, *, report: bool = True):
-    """Liczy rdzeń, opcjonalnie dopełnienie, i wypisuje metryki obu faz."""
+def build_puzzle(seed: int, size: int = 12, *, report: bool = True, difficulty: int = 3):
+    """Liczy rdzeń, dopełnienie zgodne z poziomem i wybiera planszę FINAL."""
+    profile = profile_for(difficulty)
     started = time.perf_counter()
-    core_report = generate_core_report(seed, size)
-    core = core_report.board
-    core_stats = metrics(core)
-    core_stats["fallback"] = core_report.fallback
-    core_stats["rejected"] = core_report.rejected
-    core_stats["trials"] = core_report.trials
-    if INCLUDE_FILL:
-        final, fill_stats = fill_board(core, seed)
+    pool, rejected, trial_count, emergency, hard_miss = _collect(seed, size, difficulty, None)
+    fallback = emergency is not None
+    if fallback:
+        shortlist = [emergency]
+        hard_miss = False
     else:
-        final = core.copy()
-        fill_stats = {
-            "added": 0,
-            "extra_cells": 0,
-            "cover": core_stats["filled"],
-            "area": core_stats["area"],
-            "empty": core_stats["empty"],
-            "rejected": 0,
-        }
+        shortlist = sorted(pool, key=lambda board: _rank(board, profile), reverse=True)
+        shortlist = shortlist[: max(1, profile.finalists)]
+    best: tuple | None = None
+    for index, core in enumerate(shortlist):
+        final, fill_stats = _apply_fill(core, seed, difficulty, index)
+        if not _verified(final):
+            continue
+        key = _rank(final, profile)
+        if best is None or key > best[0]:
+            best = (key, core, final, fill_stats)
+    if best is None:
+        raise RuntimeError(f"Nie udało się zbudować planszy dla seed={seed}")
+    _key, core, final, fill_stats = best
+    core_stats = metrics(core)
     final_stats = metrics(final)
+    core_stats["fallback"] = fallback
+    core_stats["rejected"] = rejected
+    core_stats["trials"] = trial_count
+    _attach_difficulty(core_stats, core, profile, hard_miss)
+    _attach_difficulty(final_stats, final, profile, hard_miss)
+    final_stats["fallback"] = fallback
     final_stats["time"] = time.perf_counter() - started
     if report:
         _report(seed, core_stats, fill_stats, final_stats)
     return Puzzle(core, final, core_stats, fill_stats, final_stats)
 
 
+def _collect(
+    seed: int,
+    size: int,
+    difficulty: int,
+    trials: int | None,
+) -> tuple[list[Board], int, int, Board | None, bool]:
+    profile = profile_for(difficulty)
+    trial_count = profile.trials if trials is None else trials
+    rng = random.Random(f"core-{difficulty}-{seed}")
+    pool: list[Board] = []
+    misses: list[Board] = []
+    rejected = 0
+    for _ in range(trial_count):
+        low, high = profile.core_arrows
+        target = rng.randint(low, high)
+        board = _build_once(rng, size, target, profile)
+        if not _verified(board):
+            rejected += 1
+            continue
+        if not _acceptable(board, profile):
+            misses.append(board)
+            rejected += 1
+            continue
+        pool.append(board)
+    if pool:
+        return pool, rejected, trial_count, None, False
+    if misses and not profile.strict_emergency:
+        closest = max(misses, key=lambda board: _rank(board, profile))
+        return [closest], rejected, trial_count, None, True
+    if profile.strict_emergency:
+        emergency = _emergency_board(size)
+        if not _verified(emergency) or not _acceptable(emergency, profile):
+            raise RuntimeError(f"Nie udało się zbudować planszy dla seed={seed}")
+        return [], rejected, trial_count, emergency, False
+    raise RuntimeError(f"Nie udało się zbudować planszy dla seed={seed}")
+
+
+def _apply_fill(core: Board, seed: int, difficulty: int, salt: int) -> tuple[Board, dict]:
+    if not INCLUDE_FILL:
+        area = core.size * core.size
+        filled = len(core.occupied)
+        return core.copy(), {
+            "added": 0,
+            "extra_cells": 0,
+            "cover": filled,
+            "area": area,
+            "empty": area - filled,
+            "rejected": 0,
+            "time_capped": False,
+        }
+    return fill_board(core, seed, difficulty=difficulty, variant_salt=salt)
+
+
+def _fit_of(board: Board, profile, hard_miss: bool) -> tuple[float, float, bool]:
+    report = analyze_difficulty(board)
+    fit = profile_fit(report, profile)
+    deviation = 1.0 - fit
+    return fit, deviation, hard_miss or fit < 0.70
+
+
+def _attach_difficulty(stats: dict, board: Board, profile, hard_miss: bool) -> None:
+    report = analyze_difficulty(board)
+    fit = profile_fit(report, profile)
+    stats["difficulty"] = profile.level
+    stats["label"] = profile.label
+    stats["fit"] = fit
+    stats["deviation"] = 1.0 - fit
+    stats["profile_miss"] = hard_miss or fit < 0.70
+    stats["outside"] = outside_targets(report, profile)
+    stats["free_ratio"] = report["free_ratio"]
+    stats["logic_difficulty"] = report["logic_difficulty"]
+    stats["spatial"] = report["spatial"]
+    stats["visual_search"] = report["visual_search"]
+    stats["blocks_per_arrow"] = report["blocks_per_arrow"]
+    stats["first_share"] = report["first_share"]
+    stats["largest_empty"] = report["largest_empty"]
+    stats["mean_bends"] = report["mean_bends"]
+    stats["mean_length"] = report["mean_length"]
+
+
 class CoreReport:
-    def __init__(self, board: Board, fallback: bool, trials: int, rejected: int) -> None:
+    def __init__(
+        self,
+        board: Board,
+        fallback: bool,
+        trials: int,
+        rejected: int,
+        fit: float = 0.0,
+        deviation: float = 1.0,
+        profile_miss: bool = False,
+        difficulty: int = 3,
+    ) -> None:
         self.board = board
         self.fallback = fallback
         self.trials = trials
         self.rejected = rejected
+        self.fit = fit
+        self.deviation = deviation
+        self.profile_miss = profile_miss
+        self.difficulty = difficulty
 
 
 class Puzzle:
@@ -161,7 +274,8 @@ def _report(seed: int, core_stats: dict, fill_stats: dict, final_stats: dict) ->
         f"free={core_stats['free']} logic={core_stats['logic']:.3f} "
         f"visual={core_stats['visual']:.3f} "
         f"fallback={'yes' if core_stats['fallback'] else 'no'} "
-        f"rejected={core_stats['rejected']}",
+        f"rejected={core_stats['rejected']} "
+        f"difficulty={core_stats['difficulty']} fit={core_stats['fit']:.2f}",
         flush=True,
     )
     print(
@@ -175,22 +289,29 @@ def _report(seed: int, core_stats: dict, fill_stats: dict, final_stats: dict) ->
         f"[final] solved={'yes' if final_stats['solved'] else 'no'} "
         f"time={final_stats['time']:.3f}s "
         f"stages={final_stats['stages']} free={final_stats['free']} "
-        f"logic={final_stats['logic']:.3f} visual={final_stats['visual']:.3f}",
+        f"logic={final_stats['logic']:.3f} visual={final_stats['visual']:.3f} "
+        f"fit={final_stats['fit']:.2f} deviation={final_stats['deviation']:.2f} "
+        f"spatial={final_stats['spatial']:.2f} "
+        f"logic_difficulty={final_stats['logic_difficulty']:.2f} "
+        f"miss={'yes' if final_stats['profile_miss'] else 'no'}",
         flush=True,
     )
 
 
-def _build_once(rng: random.Random, size: int, target: int) -> Board:
+def _build_once(rng: random.Random, size: int, target: int, profile) -> Board:
     board = Board(size)
     next_id = 1
     stagnant = 0
-    while len(board.arrows) < target and stagnant < _MAX_STAGNANT:
-        chosen = _pick_candidate(rng, board)
+    while len(board.arrows) < target and stagnant < profile.stagnant:
+        chosen = _pick_candidate(rng, board, profile)
         if chosen is None:
             stagnant += 1
             continue
         placed = Arrow(next_id, chosen.cells)
         if not _placeable(placed, board):
+            stagnant += 1
+            continue
+        if _new_blocks(placed, board) == 0 and _blocked_and_free(board)[1] >= profile.max_open:
             stagnant += 1
             continue
         board.add(placed)
@@ -199,16 +320,16 @@ def _build_once(rng: random.Random, size: int, target: int) -> Board:
     return board
 
 
-def _pick_candidate(rng: random.Random, board: Board) -> Arrow | None:
+def _pick_candidate(rng: random.Random, board: Board, profile) -> Arrow | None:
     pool: list[Arrow] = []
     seen: set[tuple[tuple[int, int], ...]] = set()
     for _ in range(_CANDIDATES):
-        if board.arrows and rng.random() < 0.78:
-            arrow = _blocking_candidate(rng, board)
+        if board.arrows and rng.random() < profile.blocking_bias:
+            arrow = _blocking_candidate(rng, board, profile)
         else:
             arrow = None
         if arrow is None:
-            arrow = _random_candidate(rng, board)
+            arrow = _random_candidate(rng, board, profile)
         if arrow is None or arrow.cells in seen:
             continue
         seen.add(arrow.cells)
@@ -216,15 +337,15 @@ def _pick_candidate(rng: random.Random, board: Board) -> Arrow | None:
     if not pool:
         return None
 
-    if board.arrows and rng.random() < 0.9:
+    if board.arrows and rng.random() < profile.prefer_block:
         blockers = [arrow for arrow in pool if _new_blocks(arrow, board) > 0]
         if blockers:
             pool = blockers
-    weights = [_weight(arrow, board) for arrow in pool]
+    weights = [_weight(arrow, board, profile) for arrow in pool]
     return rng.choices(pool, weights=weights, k=1)[0]
 
 
-def _weight(arrow: Arrow, board: Board) -> int:
+def _weight(arrow: Arrow, board: Board, profile) -> int:
     fresh = _new_blocks(arrow, board)
     bends = bend_count(arrow.cells)
     existing_bends = sum(1 for other in board.arrows if bend_count(other.cells) > 0)
@@ -233,12 +354,41 @@ def _weight(arrow: Arrow, board: Board) -> int:
         diversity += 2
     if bends == 0 and existing_bends >= 2:
         diversity += 1
-    if bends >= 2:
+    if bends >= 2 and profile.level >= 4:
         diversity += 1
-    return 1 + fresh * 5 + _block_count(arrow, board) + diversity
+    return (
+        1
+        + fresh * profile.block_weight
+        + _block_count(arrow, board)
+        + diversity
+        + _spread_bonus(arrow, board, profile.spread_bonus)
+    )
 
 
-def _blocking_candidate(rng: random.Random, board: Board) -> Arrow | None:
+def _spread_bonus(arrow: Arrow, board: Board, bonus: int) -> int:
+    if bonus <= 0 or not board.occupied:
+        return 0
+    counts = _quadrant_counts(board)
+    row, col = arrow.head
+    quadrant = _quadrant_index(row, col, board.size)
+    if counts[quadrant] <= min(counts):
+        return bonus
+    return 0
+
+
+def _quadrant_counts(board: Board) -> list[int]:
+    counts = [0, 0, 0, 0]
+    for row, col in board.occupied:
+        counts[_quadrant_index(row, col, board.size)] += 1
+    return counts
+
+
+def _quadrant_index(row: int, col: int, size: int) -> int:
+    mid = size / 2
+    return (0 if row < mid else 2) + (0 if col < mid else 1)
+
+
+def _blocking_candidate(rng: random.Random, board: Board, profile) -> Arrow | None:
     targets = list(board.arrows)
     rng.shuffle(targets)
     for target in targets[:5]:
@@ -254,19 +404,19 @@ def _blocking_candidate(rng: random.Random, board: Board) -> Arrow | None:
             directions = list(DIRECTIONS)
             rng.shuffle(directions)
             for direction in directions:
-                arrow = _arrow_from_head(rng, board, pivot, direction)
+                arrow = _arrow_from_head(rng, board, pivot, direction, profile)
                 if arrow is not None and _block_count(arrow, board) > 0:
                     return arrow
     return None
 
 
-def _random_candidate(rng: random.Random, board: Board) -> Arrow | None:
+def _random_candidate(rng: random.Random, board: Board, profile) -> Arrow | None:
     for _ in range(10):
         direction = rng.choice(DIRECTIONS)
-        head = _random_head(rng, board.size, direction, board.occupied)
+        head = _random_head(rng, board, direction, profile)
         if head is None:
             continue
-        arrow = _arrow_from_head(rng, board, head, direction)
+        arrow = _arrow_from_head(rng, board, head, direction, profile)
         if arrow is not None:
             return arrow
     return None
@@ -277,10 +427,11 @@ def _arrow_from_head(
     board: Board,
     head: tuple[int, int],
     direction: str,
+    profile,
 ) -> Arrow | None:
     if not _step_back_inside(head, direction, board.size):
         return None
-    length, want_bend, turn_p = _archetype(rng)
+    length, want_bend, turn_p = _archetype(rng, profile)
     forbidden = set(ray_cells(head[0], head[1], direction, board.size))
     cells = _grow_backward(
         rng,
@@ -301,40 +452,42 @@ def _arrow_from_head(
     return arrow
 
 
-def _archetype(rng: random.Random) -> tuple[int, bool, float]:
+def _archetype(rng: random.Random, profile) -> tuple[int, bool, float]:
     kind = rng.choices(
         ("short_straight", "long_straight", "short_bend", "long_bend"),
-        weights=(3, 2, 3, 4),
+        weights=profile.archetype_weights,
         k=1,
     )[0]
+    long_cap = max(4, min(MAX_LENGTH, profile.long_length))
     if kind == "short_straight":
         return rng.randint(2, 3), False, 0.0
     if kind == "long_straight":
-        return rng.randint(4, MAX_LENGTH), False, 0.0
+        return rng.randint(4, long_cap), False, 0.0
     if kind == "short_bend":
-        return rng.randint(3, 4), True, 0.55
-    return rng.randint(5, MAX_LENGTH), True, TURN_PROBABILITY
+        return rng.randint(3, 4), True, min(0.55, profile.turn_probability + 0.15)
+    return rng.randint(min(5, long_cap), long_cap), True, profile.turn_probability
 
 
-def _random_head(
-    rng: random.Random,
-    size: int,
-    direction: str,
-    occupied: dict[tuple[int, int], int],
-) -> tuple[int, int] | None:
+def _random_head(rng: random.Random, board: Board, direction: str, profile) -> tuple[int, int] | None:
     d_row, d_col = DIRECTION_DELTA[OPPOSITE[direction]]
     options = []
-    for row in range(size):
-        for col in range(size):
+    for row in range(board.size):
+        for col in range(board.size):
             behind = (row + d_row, col + d_col)
-            if not _inside(behind, size):
+            if not _inside(behind, board.size):
                 continue
-            if (row, col) in occupied or behind in occupied:
+            if (row, col) in board.occupied or behind in board.occupied:
                 continue
             options.append((row, col))
     if not options:
         return None
-    return rng.choice(options)
+    counts = _quadrant_counts(board)
+    lightest = min(counts) if board.occupied else 0
+    weights = []
+    for row, col in options:
+        bonus = profile.spread_bonus if counts[_quadrant_index(row, col, board.size)] <= lightest else 0
+        weights.append(1 + bonus)
+    return rng.choices(options, weights=weights, k=1)[0]
 
 
 def _grow_backward(
@@ -483,24 +636,23 @@ def _shape_mix(board: Board) -> tuple[int, int]:
     return curved, straight
 
 
-def _acceptable(board: Board) -> bool:
+def _acceptable(board: Board, profile) -> bool:
     total = len(board.arrows)
-    if not (MIN_ARROWS <= total <= MAX_ARROWS):
+    low, high = profile.hard_arrows
+    if not (low <= total <= high):
         return False
     blocked, free = _blocked_and_free(board)
-    if blocked < 1 or free < 1 or free > blocked:
+    if free < profile.hard_min_free or blocked < profile.hard_min_blocked:
+        return False
+    if profile.hard_free_le_blocked and free > blocked:
         return False
     curved, straight = _shape_mix(board)
-    return curved >= 2 and straight >= 2
+    return curved >= profile.hard_min_curved and straight >= profile.hard_min_straight
 
 
-def _rank(board: Board) -> tuple:
-    """Logika, potem kompozycja, pokrycie dopiero na końcu."""
-    return selection_key(
-        analyze_logic(board)["score"],
-        analyze_visual(board)["score"],
-        len(board.occupied),
-    )
+def _rank(board: Board, profile) -> tuple:
+    """Zgodność z poziomem, potem rozłożenie na planszy."""
+    return selection_rank(board, profile)
 
 
 def _emergency_board(size: int = 12) -> Board:

@@ -63,6 +63,95 @@ def _evenness(counts: list[int]) -> float:
     return _clamp(1.0 - spread / 4.0)
 
 
+def spatial_balance(board: Board) -> dict:
+    """Rozproszenie po planszy. Pusta, ale rozłożona plansza może wypaść wysoko."""
+    area = board.size * board.size
+    if not board.occupied:
+        parts = {
+            "quadrants": 0.0,
+            "heads": 0.0,
+            "coverage": 0.0,
+            "local": 1.0,
+            "openness": 1.0,
+        }
+        return {"score": 0.0, "parts": parts, "largest_empty": area}
+    mid = board.size / 2
+    cells = [0, 0, 0, 0]
+    heads = [0, 0, 0, 0]
+    for row, col in board.occupied:
+        cells[_quadrant(row, col, mid)] += 1
+    for arrow in board.arrows:
+        row, col = arrow.head
+        heads[_quadrant(row, col, mid)] += 1
+    used = sum(1 for count in cells if count) / 4
+    even_cells = _evenness(cells)
+    even_heads = _evenness(heads) if board.arrows else 0.0
+    local = _clamp(1.0 - _clump_ratio(board))
+    largest = _largest_empty(board)
+    hole_share = largest / area
+    openness = 1.0 if used >= 0.75 else _clamp(1.0 - max(0.0, hole_share - 0.55) / 0.45)
+    parts = {
+        "quadrants": even_cells,
+        "heads": even_heads,
+        "coverage": used,
+        "local": local,
+        "openness": openness,
+    }
+    score = (
+        0.30 * even_cells
+        + 0.20 * even_heads
+        + 0.20 * used
+        + 0.15 * local
+        + 0.15 * openness
+    )
+    return {"score": _clamp(score), "parts": parts, "largest_empty": largest}
+
+
+def _clump_ratio(board: Board) -> float:
+    occupied = board.occupied
+    if not occupied:
+        return 0.0
+    knots = 0
+    for row, col in occupied:
+        near = 0
+        for d_row in (-1, 0, 1):
+            for d_col in (-1, 0, 1):
+                if d_row == 0 and d_col == 0:
+                    continue
+                if (row + d_row, col + d_col) in occupied:
+                    near += 1
+        if near >= 5:
+            knots += 1
+    return knots / len(occupied)
+
+
+def _largest_empty(board: Board) -> int:
+    empty = {
+        (row, col)
+        for row in range(board.size)
+        for col in range(board.size)
+        if (row, col) not in board.occupied
+    }
+    seen: set[tuple[int, int]] = set()
+    largest = 0
+    for start in empty:
+        if start in seen:
+            continue
+        stack = [start]
+        seen.add(start)
+        size = 0
+        while stack:
+            row, col = stack.pop()
+            size += 1
+            for nxt in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+                if nxt in empty and nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        if size > largest:
+            largest = size
+    return largest
+
+
 def _diversity(arrows, bends: list[int]) -> float:
     count = len(arrows)
     if count <= 0:

@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import random
 import time
+import tkinter as tk
 import unittest
 
 import generator
 from engine import Arrow, Board, bend_count, can_move, solve_board
 from fill import fill_board, select_variant
 from generator import build_puzzle, generate_board, generate_core, generate_core_report
+from difficulty import LABELS, analyze_difficulty, profile_for
 from quality_logic import LOGIC_WEIGHTS, analyze_logic, release_curve, selection_key
-from quality_visual import VISUAL_WEIGHTS, analyze_visual
-from main import arrow_geometry, point_hits_body
+from quality_visual import VISUAL_WEIGHTS, analyze_visual, spatial_balance
+import main
+from main import ArrowApp, arrow_geometry, point_hits_body
 
 SEED_COUNT = 200
 DIRECTIONS = {
@@ -550,6 +553,122 @@ def _open_region_board() -> Board:
         _place(board, _leftward(row, 11, 6))
         _place(board, _leftward(row, 5, 0))
     return board
+
+
+class DifficultyTests(unittest.TestCase):
+    def test_every_level_is_solvable_and_keeps_the_core(self):
+        rows = {level: [] for level in range(1, 6)}
+        for seed in range(8):
+            for level in range(1, 6):
+                first = build_puzzle(seed, difficulty=level, report=False)
+                second = build_puzzle(seed, difficulty=level, report=False)
+                self.assertEqual(dump(first.final), dump(second.final))
+                self.assertEqual(dump(first.core), dump(second.core))
+                self.assertTrue(first.final_stats["solved"])
+                self.assertFalse(first.final_stats["fallback"])
+                self.assertLess(first.final_stats["time"], 2.0)
+                self.assertGreaterEqual(first.core_stats["trials"], 1)
+                self.assertLessEqual(first.core_stats["trials"], 14)
+                self.assertIn("deviation", first.final_stats)
+                self.assertIn("logic_difficulty", first.final_stats)
+                self.assertIn("spatial", first.final_stats)
+                GeneratorTests.assert_geometry(self, first.final)
+                GeneratorTests.assert_prefix_and_peel(self, first.core, first.final)
+                rows[level].append(first.final_stats)
+        depths = [self._median(rows[level], "depth") for level in range(1, 6)]
+        ratios = [self._median(rows[level], "free_ratio") for level in range(1, 6)]
+        scores = [self._median(rows[level], "logic_difficulty") for level in range(1, 6)]
+        self.assertLess(depths[0], depths[2])
+        self.assertLess(depths[2], depths[4])
+        self.assertGreater(ratios[0], ratios[2])
+        self.assertGreater(ratios[2], ratios[4])
+        self.assertLess(scores[0], scores[1])
+        self.assertLess(scores[1], scores[4])
+        self.assertGreaterEqual(depths[4], depths[3])
+        self.assertGreater(self._median(rows[1], "spatial"), 0.7)
+
+    def test_same_seed_changes_with_difficulty(self):
+        easy = build_puzzle(9, difficulty=1, report=False)
+        expert = build_puzzle(9, difficulty=5, report=False)
+        self.assertNotEqual(dump(easy.final), dump(expert.final))
+        self.assertGreater(easy.final_stats["free_ratio"], expert.final_stats["free_ratio"])
+        self.assertLess(easy.final_stats["logic_difficulty"], expert.final_stats["logic_difficulty"])
+
+    def test_unknown_difficulty_is_rejected(self):
+        with self.assertRaises(ValueError):
+            profile_for(0)
+        with self.assertRaises(ValueError):
+            build_puzzle(1, difficulty=6, report=False)
+
+    def test_difficulty_report_matches_the_dependency_graph(self):
+        board = build_puzzle(4, difficulty=2, report=False).final
+        logic = analyze_logic(board)
+        report = analyze_difficulty(board)
+        self.assertEqual(report["blocks"], logic["blocks"])
+        self.assertEqual(report["depth"], logic["depth"])
+        self.assertEqual(report["curve"], logic["curve"])
+        self.assertEqual(sum(report["curve"]), report["arrows"])
+        self.assertGreaterEqual(report["logic_difficulty"], 0.0)
+        self.assertLessEqual(report["logic_difficulty"], 1.0)
+        self.assertGreaterEqual(report["spatial"], 0.0)
+        self.assertLessEqual(report["spatial"], 1.0)
+
+    def test_spatial_balance_accepts_airy_spread(self):
+        packed = Board(12)
+        packed.add(Arrow(1, ((0, 0), (0, 1))))
+        packed.add(Arrow(2, ((0, 2), (1, 2))))
+        packed.add(Arrow(3, ((1, 0), (1, 1))))
+        spread = Board(12)
+        spread.add(Arrow(1, ((0, 0), (0, 1))))
+        spread.add(Arrow(2, ((0, 10), (0, 11))))
+        spread.add(Arrow(3, ((11, 0), (11, 1))))
+        spread.add(Arrow(4, ((11, 10), (11, 11))))
+        self.assertGreater(spatial_balance(spread)["score"], spatial_balance(packed)["score"])
+        self.assertGreater(spatial_balance(spread)["largest_empty"], 100)
+
+    def test_slider_does_not_replace_the_board(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ArrowApp(root)
+            root.update_idletasks()
+            before = dump(app.board)
+            seed = app.seed
+            app.difficulty.set(1)
+            app._on_difficulty("1")
+            self.assertEqual(seed, app.seed)
+            self.assertEqual(before, dump(app.board))
+            self.assertEqual(app.diff_caption.cget("text"), f"1 — {LABELS[1]}")
+            self.assertEqual(int(app.difficulty.get()), 1)
+        finally:
+            root.destroy()
+
+    def test_new_board_reads_the_slider(self):
+        root = tk.Tk()
+        root.withdraw()
+        calls = []
+        original = main.generate_board
+
+        def wrapped(seed, size=12, difficulty=3):
+            calls.append(difficulty)
+            return original(seed, size=size, difficulty=difficulty)
+
+        main.generate_board = wrapped
+        try:
+            app = ArrowApp(root)
+            self.assertEqual(calls[0], 3)
+            app.difficulty.set(5)
+            app.new_board(seed=21)
+            self.assertEqual(calls[-1], 5)
+            self.assertEqual(dump(app.board), dump(original(21, difficulty=5)))
+            self.assertEqual(app.seed, 21)
+        finally:
+            main.generate_board = original
+            root.destroy()
+
+    def _median(self, rows: list[dict], key: str) -> float:
+        values = sorted(row[key] for row in rows)
+        return values[len(values) // 2]
 
 
 class HitTests(unittest.TestCase):

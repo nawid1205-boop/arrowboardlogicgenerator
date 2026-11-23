@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 import tkinter as tk
 
+from difficulty import LABELS
 from engine import Arrow, can_move
 from generator import generate_board
 
@@ -248,8 +249,11 @@ class ArrowApp:
         header = tk.Frame(root, bg=BACKGROUND)
         header.pack(side="top", fill="x", pady=(16, 6))
 
+        controls = tk.Frame(header, bg=BACKGROUND)
+        controls.pack()
+
         self.button = tk.Button(
-            header,
+            controls,
             text="Nowa plansza",
             command=self.new_board,
             bg="#161616",
@@ -264,7 +268,48 @@ class ArrowApp:
             highlightthickness=0,
             cursor="hand2",
         )
-        self.button.pack()
+        self.button.pack(side="left", padx=(0, 22))
+
+        difficulty_box = tk.Frame(controls, bg=BACKGROUND)
+        difficulty_box.pack(side="left")
+        tk.Label(
+            difficulty_box,
+            text="Difficulty",
+            bg=BACKGROUND,
+            fg="#c8c8c8",
+            font=("Segoe UI", 10),
+        ).pack(anchor="w")
+        self.difficulty = tk.IntVar(value=3)
+        self.diff_caption = tk.Label(
+            difficulty_box,
+            text=f"3 — {LABELS[3]}",
+            bg=BACKGROUND,
+            fg="#8a8a8a",
+            font=("Segoe UI", 9),
+        )
+        self.scale = tk.Scale(
+            difficulty_box,
+            from_=1,
+            to=5,
+            orient="horizontal",
+            resolution=1,
+            variable=self.difficulty,
+            command=self._on_difficulty,
+            bg=BACKGROUND,
+            fg="#d0d0d0",
+            troughcolor="#1a1a1a",
+            activebackground="#3a3a3a",
+            highlightthickness=0,
+            bd=0,
+            relief="flat",
+            sliderrelief="flat",
+            sliderlength=16,
+            length=160,
+            showvalue=False,
+            font=("Segoe UI", 9),
+        )
+        self.scale.pack(anchor="w")
+        self.diff_caption.pack(anchor="w")
 
         self.canvas = tk.Canvas(
             root,
@@ -290,7 +335,7 @@ class ArrowApp:
             if seed is None:
                 seed = random.SystemRandom().randrange(0, 2**31)
             try:
-                board = generate_board(seed)
+                board = generate_board(seed, difficulty=int(self.difficulty.get()))
             except RuntimeError as error:
                 print(error)
                 self._error = "Nie udało się wygenerować planszy."
@@ -307,6 +352,10 @@ class ArrowApp:
         finally:
             self._busy = False
             self.button.configure(state="normal")
+
+    def _on_difficulty(self, _value: str | None = None) -> None:
+        level = int(float(self.difficulty.get()))
+        self.diff_caption.configure(text=f"{level} — {LABELS[level]}")
 
     def redraw(self) -> None:
         self.canvas.delete("all")

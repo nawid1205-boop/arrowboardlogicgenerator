@@ -23,11 +23,9 @@ from engine import (
     ray_cells,
     solve_board,
 )
-from quality_logic import analyze_logic, selection_key
-from quality_visual import analyze_visual
+from difficulty import profile_for, selection_rank
 
 _MAX_FILL = 8
-_VARIANTS = 4
 _NODE_LIMIT = 8
 _GROW_CAP = 48
 _NEIGHBORS = ((-1, 0), (0, 1), (1, 0), (0, -1))
@@ -38,14 +36,17 @@ def fill_board(
     seed: int,
     *,
     node_limit: int = _NODE_LIMIT,
+    difficulty: int = 3,
+    variant_salt: int = 0,
 ) -> tuple[Board, dict]:
-    """Buduje kilka dopełnień i zostawia to o lepszej jakości, nie o większym pokryciu."""
-    budget = max(0, min(_MAX_FILL, node_limit))
-    rng = random.Random(f"fill-{seed}")
+    """Buduje kilka dopełnień i zostawia to, które trzyma poziom trudności."""
+    profile = profile_for(difficulty)
+    budget = max(0, min(profile.fill_budget, _MAX_FILL, node_limit))
+    rng = random.Random(f"fill-{difficulty}-{seed}-{variant_salt}")
     core_free = sum(1 for arrow in core.arrows if can_move(arrow, core))
     variants = [core.copy()]
     rejected = 0
-    for _ in range(_VARIANTS):
+    for _ in range(profile.fill_variants):
         local = random.Random(rng.randrange(1 << 30))
         board = core.copy()
         placed = 0
@@ -53,7 +54,7 @@ def fill_board(
             candidates = _candidates(local, board)
             if not candidates:
                 break
-            chosen = _chain_candidate(board, candidates, core_free)
+            chosen = _chain_candidate(board, candidates, core_free, profile.free_slack)
             if chosen is None:
                 rejected += len(candidates)
                 break
@@ -61,7 +62,7 @@ def fill_board(
             placed += 1
             rejected += max(0, len(candidates) - 1)
         variants.append(board)
-    best, dropped = select_variant(core, variants)
+    best, dropped = select_variant(core, variants, difficulty)
     rejected += dropped
     extra = len(best.occupied) - len(core.occupied)
     area = core.size * core.size
@@ -76,8 +77,9 @@ def fill_board(
     }
 
 
-def select_variant(core: Board, variants: list[Board]) -> tuple[Board, int]:
-    """Wybiera wariant: logika, potem kompozycja, pokrycie na końcu."""
+def select_variant(core: Board, variants: list[Board], difficulty: int = 3) -> tuple[Board, int]:
+    """Wybiera wariant zgodny z poziomem. Pokrycie nie jest pierwszym kryterium."""
+    profile = profile_for(difficulty)
     core_free = sum(1 for arrow in core.arrows if can_move(arrow, core))
     accepted: list[Board] = []
     dropped = 0
@@ -88,22 +90,35 @@ def select_variant(core: Board, variants: list[Board]) -> tuple[Board, int]:
             dropped += 1
     if not accepted:
         return core.copy(), dropped
-    return max(accepted, key=_key), dropped
+    return max(accepted, key=lambda board: _fill_key(board, profile, core)), dropped
 
 
-def _key(board: Board) -> tuple:
-    return selection_key(
-        analyze_logic(board)["score"],
-        analyze_visual(board)["score"],
-        len(board.occupied),
-    )
+def _fill_key(board: Board, profile, core: Board) -> tuple:
+    rank = selection_rank(board, profile)
+    if _open_rows(core) < 3:
+        return rank
+    extra = len(board.occupied) - len(core.occupied)
+    return (rank[0], extra, *rank[1:])
 
 
-def _chain_candidate(board: Board, candidates: list[Arrow], core_free: int) -> Arrow | None:
+def _open_rows(board: Board) -> int:
+    count = 0
+    for row in range(board.size):
+        if all((row, col) not in board.occupied for col in range(board.size)):
+            count += 1
+    return count
+
+
+def _chain_candidate(
+    board: Board,
+    candidates: list[Arrow],
+    core_free: int,
+    free_slack: int = 1,
+) -> Arrow | None:
     """Dokłada strzałkę, która przedłuża blokadę, zamiast otwierać nowy luźny ruch."""
     current_free = sum(1 for arrow in board.arrows if can_move(arrow, board))
     for arrow in candidates:
-        if _blocks_now(arrow, board) == 0 and current_free >= core_free + 1:
+        if _blocks_now(arrow, board) == 0 and current_free >= core_free + free_slack:
             continue
         return arrow
     return None
