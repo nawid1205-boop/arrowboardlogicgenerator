@@ -8,8 +8,10 @@ import unittest
 
 import generator
 from engine import Arrow, Board, bend_count, can_move, solve_board
-from fill import fill_board
-from generator import build_puzzle, generate_board, generate_core
+from fill import fill_board, select_variant
+from generator import build_puzzle, generate_board, generate_core, generate_core_report
+from quality_logic import LOGIC_WEIGHTS, analyze_logic, release_curve, selection_key
+from quality_visual import VISUAL_WEIGHTS, analyze_visual
 from main import arrow_geometry, point_hits_body
 
 SEED_COUNT = 200
@@ -188,6 +190,11 @@ class GeneratorTests(unittest.TestCase):
         final_free = []
         core_depth = []
         final_stages = []
+        fallbacks = []
+        core_logic = []
+        final_logic = []
+        core_visual = []
+        final_visual = []
         for seed in range(SEED_COUNT):
             with self.subTest(seed=seed):
                 first = build_puzzle(seed, report=seed < 3)
@@ -206,6 +213,12 @@ class GeneratorTests(unittest.TestCase):
                 final_free.append(first.final_stats["free"])
                 core_depth.append(first.core_stats["depth"])
                 final_stages.append(first.final_stats["stages"])
+                fallbacks.append(first.core_stats["fallback"])
+                core_logic.append(first.core_stats["logic"])
+                final_logic.append(first.final_stats["logic"])
+                core_visual.append(first.core_stats["visual"])
+                final_visual.append(first.final_stats["visual"])
+                self.assertFalse(first.fill_stats["time_capped"])
                 for arrow in first.core.arrows:
                     bends = bend_count(arrow.cells)
                     if bends == 0 and len(arrow.cells) <= 3:
@@ -221,6 +234,7 @@ class GeneratorTests(unittest.TestCase):
             self.assertGreater(count, 0, name)
         self.assertGreater(fill_arrows, 0)
         self.assertGreater(fill_curved, 0)
+        self.assertEqual(sum(1 for seed_fallback in fallbacks if seed_fallback), 0)
         print(
             f"[summary] seeds={SEED_COUNT} "
             f"core_cover={min(core_cover)}-{max(core_cover)} "
@@ -229,7 +243,11 @@ class GeneratorTests(unittest.TestCase):
             f"core_free={min(core_free)}-{max(core_free)} "
             f"final_free={min(final_free)}-{max(final_free)} "
             f"core_depth={min(core_depth)}-{max(core_depth)} "
-            f"stages={min(final_stages)}-{max(final_stages)}",
+            f"stages={min(final_stages)}-{max(final_stages)} "
+            f"core_logic={min(core_logic):.3f}-{max(core_logic):.3f} "
+            f"final_logic={min(final_logic):.3f}-{max(final_logic):.3f} "
+            f"core_visual={min(core_visual):.3f}-{max(core_visual):.3f} "
+            f"final_visual={min(final_visual):.3f}-{max(final_visual):.3f}",
             flush=True,
         )
 
@@ -386,6 +404,114 @@ class GeneratorTests(unittest.TestCase):
             own = set(arrow.cells)
             self.assertTrue(own.isdisjoint(independent_exit(arrow, board.size)))
             self.assertEqual(can_move(arrow, board), not independently_blocked(arrow, board))
+
+
+class QualityTests(unittest.TestCase):
+    def test_dependency_edge_follows_the_exit(self):
+        board = Board(12)
+        board.add(Arrow(1, ((0, 0), (0, 1))))
+        board.add(Arrow(2, ((0, 4), (0, 5))))
+        report = analyze_logic(board)
+        self.assertEqual(report["blockers"][1], [2])
+        self.assertEqual(report["blockers"][2], [])
+        self.assertGreaterEqual(report["depth"], 2)
+        self.assertEqual(report["splits"], 0)
+        self.assertEqual(report["isolated"], 0)
+
+    def test_release_curve_accounts_for_every_arrow(self):
+        board = Board(12)
+        board.add(Arrow(1, ((1, 0), (1, 1), (1, 2))))
+        board.add(Arrow(2, ((1, 5), (1, 6))))
+        board.add(Arrow(3, ((1, 9), (1, 10))))
+        curve = release_curve(board)
+        self.assertEqual(sum(curve), len(board.arrows))
+        self.assertGreaterEqual(curve[0], 1)
+        report = analyze_logic(board)
+        self.assertEqual(report["curve"], curve)
+        self.assertEqual(report["stages"], len(curve))
+        self.assertTrue(report["solved"])
+
+    def test_chain_has_more_depth_than_independent_arrows(self):
+        chain = Board(12)
+        chain.add(Arrow(1, ((2, 0), (2, 1))))
+        chain.add(Arrow(2, ((2, 4), (2, 5))))
+        chain.add(Arrow(3, ((2, 8), (2, 9))))
+        loose = Board(12)
+        loose.add(Arrow(1, ((0, 10), (0, 11))))
+        loose.add(Arrow(2, ((4, 10), (4, 11))))
+        loose.add(Arrow(3, ((8, 10), (8, 11))))
+        chain_report = analyze_logic(chain)
+        loose_report = analyze_logic(loose)
+        self.assertGreater(chain_report["depth"], loose_report["depth"])
+        self.assertGreater(chain_report["parts"]["depth"], loose_report["parts"]["depth"])
+        self.assertEqual(loose_report["isolated"], 3)
+        self.assertGreater(chain_report["parts"]["relevance"], loose_report["parts"]["relevance"])
+
+    def test_scores_stay_inside_zero_and_one_and_follow_weights(self):
+        board = build_puzzle(11, report=False).core
+        logic = analyze_logic(board)
+        visual = analyze_visual(board)
+        for value in (*logic["parts"].values(), logic["score"]):
+            self.assertGreaterEqual(value, 0.0)
+            self.assertLessEqual(value, 1.0)
+        for value in (*visual["parts"].values(), visual["score"]):
+            self.assertGreaterEqual(value, 0.0)
+            self.assertLessEqual(value, 1.0)
+        saved = dict(LOGIC_WEIGHTS)
+        LOGIC_WEIGHTS.update({name: 0.0 for name in saved})
+        LOGIC_WEIGHTS["opening"] = 1.0
+        try:
+            only_opening = analyze_logic(board)["score"]
+        finally:
+            LOGIC_WEIGHTS.update(saved)
+        self.assertAlmostEqual(only_opening, logic["parts"]["opening"])
+        again = analyze_logic(board)
+        self.assertEqual(again["score"], logic["score"])
+        self.assertEqual(again["curve"], logic["curve"])
+        self.assertEqual(analyze_visual(board)["score"], visual["score"])
+        self.assertGreater(sum(VISUAL_WEIGHTS.values()), 0)
+
+    def test_spread_board_is_more_balanced_than_a_corner_cluster(self):
+        packed = Board(12)
+        packed.add(Arrow(1, ((0, 0), (0, 1))))
+        packed.add(Arrow(2, ((1, 0), (1, 1))))
+        spread = Board(12)
+        spread.add(Arrow(1, ((0, 0), (0, 1))))
+        spread.add(Arrow(2, ((10, 10), (10, 11))))
+        self.assertGreater(
+            analyze_visual(spread)["parts"]["balance"],
+            analyze_visual(packed)["parts"]["balance"],
+        )
+
+    def test_fill_rejects_extra_free_arrows_even_when_they_cover_more(self):
+        core = Board(12)
+        core.add(Arrow(1, ((0, 0), (0, 1))))
+        fuller = core.copy()
+        fuller.add(Arrow(2, ((3, 0), (3, 1))))
+        fuller.add(Arrow(3, ((5, 0), (5, 1))))
+        fuller.add(Arrow(4, ((7, 0), (7, 1))))
+        chosen, dropped = select_variant(core, [core.copy(), fuller])
+        self.assertEqual(dump(chosen), dump(core))
+        self.assertGreaterEqual(dropped, 1)
+        self.assertGreater(selection_key(0.90, 0.40, 20), selection_key(0.70, 0.95, 100))
+        self.assertGreater(selection_key(0.80, 0.70, 30), selection_key(0.81, 0.40, 90))
+        self.assertLess(selection_key(0.80, 0.60, 30), selection_key(0.80, 0.60, 90))
+
+    def test_missing_candidates_report_the_fallback_board(self):
+        report = generate_core_report(3, trials=0)
+        self.assertTrue(report.fallback)
+        self.assertEqual(report.trials, 0)
+        self.assertGreaterEqual(len(report.board.arrows), 12)
+        order, error = solve_board(report.board)
+        self.assertIsNone(error)
+        self.assertEqual(len(order), len(report.board.arrows))
+        curved = sum(1 for arrow in report.board.arrows if bend_count(arrow.cells))
+        straight = len(report.board.arrows) - curved
+        free = sum(1 for arrow in report.board.arrows if can_move(arrow, report.board))
+        self.assertGreaterEqual(curved, 2)
+        self.assertGreaterEqual(straight, 2)
+        self.assertGreaterEqual(free, 1)
+        self.assertLessEqual(free, len(report.board.arrows) - free)
 
 
 def _leftward(row: int, tail_col: int, head_col: int):

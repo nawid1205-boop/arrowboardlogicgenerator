@@ -2,14 +2,14 @@
 
 Każda nowa strzałka wchodzi tylko wtedy, gdy jej wyjazd jest wolny względem
 planszy już ułożonej. Dzięki temu odwrotna kolejność strzałek FILL, a potem
-rozwiązanie rdzenia, czyści całą planszę. Pełne pokrycie jest celem, nie
-warunkiem: ślepe luki i dopełnienie psujące otwarcie są odrzucane.
+rozwiązanie rdzenia, czyści całą planszę. Wybór wariantu idzie za jakością
+logiczną i kompozycją. Pokrycie nie decyduje, a dopełnienie psujące otwarcie
+jest odrzucane.
 """
 
 from __future__ import annotations
 
 import random
-import time
 
 from engine import (
     DIRECTION_DELTA,
@@ -23,11 +23,12 @@ from engine import (
     ray_cells,
     solve_board,
 )
+from quality_logic import analyze_logic, selection_key
+from quality_visual import analyze_visual
 
-_MAX_FILL = 16
-_BRANCH = 2
-_NODE_LIMIT = 70
-_TIME_LIMIT = 0.12
+_MAX_FILL = 8
+_VARIANTS = 4
+_NODE_LIMIT = 8
 _GROW_CAP = 48
 _NEIGHBORS = ((-1, 0), (0, 1), (1, 0), (0, -1))
 
@@ -38,47 +39,30 @@ def fill_board(
     *,
     node_limit: int = _NODE_LIMIT,
 ) -> tuple[Board, dict]:
-    """Zwraca kopię planszy z dopełnieniem oraz metryki samej fazy FILL."""
-    started = time.perf_counter()
+    """Buduje kilka dopełnień i zostawia to o lepszej jakości, nie o większym pokryciu."""
+    budget = max(0, min(_MAX_FILL, node_limit))
     rng = random.Random(f"fill-{seed}")
-    board = core.copy()
     core_free = sum(1 for arrow in core.arrows if can_move(arrow, core))
-    best = board.copy()
-    best_key = _key(core, board)
+    variants = [core.copy()]
     rejected = 0
-    nodes = 0
-
-    def search() -> None:
-        nonlocal best, best_key, rejected, nodes
-        nodes += 1
-        if _accept(core, board, core_free):
-            key = _key(core, board)
-            if key > best_key:
-                best = board.copy()
-                best_key = key
-        fill_count = len(board.arrows) - len(core.arrows)
-        if (
-            nodes >= node_limit
-            or fill_count >= _MAX_FILL
-            or time.perf_counter() - started > _TIME_LIMIT
-        ):
-            return
-        candidates = _candidates(rng, board)
-        if len(candidates) > _BRANCH:
-            rejected += len(candidates) - _BRANCH
-        for arrow in candidates[:_BRANCH]:
-            board.add(arrow)
-            search()
-            board.remove(arrow.id)
-            if nodes >= node_limit or time.perf_counter() - started > _TIME_LIMIT:
-                return
-
-    if _has_room(board):
-        search()
-
-    if not _accept(core, best, core_free):
-        best = core.copy()
-
+    for _ in range(_VARIANTS):
+        local = random.Random(rng.randrange(1 << 30))
+        board = core.copy()
+        placed = 0
+        while placed < budget:
+            candidates = _candidates(local, board)
+            if not candidates:
+                break
+            chosen = _chain_candidate(board, candidates, core_free)
+            if chosen is None:
+                rejected += len(candidates)
+                break
+            board.add(chosen)
+            placed += 1
+            rejected += max(0, len(candidates) - 1)
+        variants.append(board)
+    best, dropped = select_variant(core, variants)
+    rejected += dropped
     extra = len(best.occupied) - len(core.occupied)
     area = core.size * core.size
     return best, {
@@ -88,19 +72,54 @@ def fill_board(
         "area": area,
         "empty": area - len(best.occupied),
         "rejected": rejected,
+        "time_capped": False,
     }
 
 
-def _has_room(board: Board) -> bool:
-    return any(len(component) >= 2 for component in _components(board))
+def select_variant(core: Board, variants: list[Board]) -> tuple[Board, int]:
+    """Wybiera wariant: logika, potem kompozycja, pokrycie na końcu."""
+    core_free = sum(1 for arrow in core.arrows if can_move(arrow, core))
+    accepted: list[Board] = []
+    dropped = 0
+    for board in variants:
+        if _accept(core, board, core_free):
+            accepted.append(board)
+        else:
+            dropped += 1
+    if not accepted:
+        return core.copy(), dropped
+    return max(accepted, key=_key), dropped
 
 
-def _key(core: Board, board: Board) -> tuple:
-    fill = board.arrows[len(core.arrows) :]
-    curved = sum(1 for arrow in fill if bend_count(arrow.cells) > 0)
-    long = sum(1 for arrow in fill if len(arrow.cells) >= 4)
-    free = sum(1 for arrow in board.arrows if can_move(arrow, board))
-    return (len(board.occupied), long, curved, -free)
+def _key(board: Board) -> tuple:
+    return selection_key(
+        analyze_logic(board)["score"],
+        analyze_visual(board)["score"],
+        len(board.occupied),
+    )
+
+
+def _chain_candidate(board: Board, candidates: list[Arrow], core_free: int) -> Arrow | None:
+    """Dokłada strzałkę, która przedłuża blokadę, zamiast otwierać nowy luźny ruch."""
+    current_free = sum(1 for arrow in board.arrows if can_move(arrow, board))
+    for arrow in candidates:
+        if _blocks_now(arrow, board) == 0 and current_free >= core_free + 1:
+            continue
+        return arrow
+    return None
+
+
+def _blocks_now(arrow: Arrow, board: Board) -> int:
+    covered = set(arrow.cells)
+    blocked = 0
+    for other in board.arrows:
+        if not can_move(other, board):
+            continue
+        for cell in exit_cells(other, board.size):
+            if cell in covered:
+                blocked += 1
+                break
+    return blocked
 
 
 def _accept(core: Board, board: Board, core_free: int) -> bool:
@@ -197,7 +216,10 @@ def _score(arrow: Arrow, board: Board, base_holes: int) -> int:
                 break
     bends = bend_count(arrow.cells)
     length = len(arrow.cells)
-    score = fresh * 8 + length * 2 + bends * 2 + min(room, 3) * 2 - max(0, holes) * 5
+    length_fit = 2 if 4 <= length <= 6 else (1 if length >= 3 else 0)
+    bend_fit = 1 if bends == 1 else 0
+    twist_penalty = 3 if bends >= 3 else 0
+    score = fresh * 8 + length_fit * 2 + bend_fit - twist_penalty - max(0, holes) * 4
     if length == 2 and fresh == 0:
         score -= 4
     if room == 0 and fresh == 0:

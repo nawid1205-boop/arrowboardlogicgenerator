@@ -31,6 +31,8 @@ from engine import (
     solve_board,
 )
 from fill import fill_board
+from quality_logic import analyze_logic, selection_key
+from quality_visual import analyze_visual
 
 # Diagnostyka: False zostawia sam rdzeń, True pokazuje rdzeń i dopełnienie.
 INCLUDE_FILL = True
@@ -41,7 +43,7 @@ MIN_LENGTH = 2
 MAX_LENGTH = 8
 TURN_PROBABILITY = 0.30
 
-_MAX_TRIALS = 10
+_MAX_TRIALS = 14
 _MAX_STAGNANT = 28
 _CANDIDATES = 7
 _GROW_NODE_CAP = 500
@@ -54,34 +56,40 @@ def generate_board(seed: int, size: int = 12) -> Board:
 
 def generate_core(seed: int, size: int = 12) -> Board:
     """Buduje kilka rdzeni i zostawia najlepszy pod względem jakości."""
-    rng = random.Random(seed)
-    best: Board | None = None
-    best_rank: tuple | None = None
+    return generate_core_report(seed, size).board
 
-    for _ in range(_MAX_TRIALS):
+
+def generate_core_report(seed: int, size: int = 12, trials: int | None = None) -> CoreReport:
+    """Wybiera rdzeń tylko spośród kandydatów spełniających twarde warunki."""
+    trial_count = _MAX_TRIALS if trials is None else trials
+    rng = random.Random(seed)
+    pool: list[Board] = []
+    rejected = 0
+    for _ in range(trial_count):
         target = rng.randint(MIN_ARROWS, MAX_ARROWS)
         board = _build_once(rng, size, target)
-        if not _verified(board):
+        if not _verified(board) or not _acceptable(board):
+            rejected += 1
             continue
-        rank = _rank(board)
-        if best_rank is None or rank > best_rank:
-            best = board
-            best_rank = rank
-
-    if best is not None and _has_opening(best):
-        return best
-
-    emergency = _emergency_board(size)
-    if not _verified(emergency):
-        raise RuntimeError(f"Nie udało się zbudować planszy dla seed={seed}")
-    return emergency
+        pool.append(board)
+    if not pool:
+        emergency = _emergency_board(size)
+        if not _verified(emergency) or not _acceptable(emergency):
+            raise RuntimeError(f"Nie udało się zbudować planszy dla seed={seed}")
+        return CoreReport(emergency, True, trial_count, rejected)
+    best = max(pool, key=_rank)
+    return CoreReport(best, False, trial_count, rejected)
 
 
 def build_puzzle(seed: int, size: int = 12, *, report: bool = True):
     """Liczy rdzeń, opcjonalnie dopełnienie, i wypisuje metryki obu faz."""
     started = time.perf_counter()
-    core = generate_core(seed, size)
+    core_report = generate_core_report(seed, size)
+    core = core_report.board
     core_stats = metrics(core)
+    core_stats["fallback"] = core_report.fallback
+    core_stats["rejected"] = core_report.rejected
+    core_stats["trials"] = core_report.trials
     if INCLUDE_FILL:
         final, fill_stats = fill_board(core, seed)
     else:
@@ -101,6 +109,14 @@ def build_puzzle(seed: int, size: int = 12, *, report: bool = True):
     return Puzzle(core, final, core_stats, fill_stats, final_stats)
 
 
+class CoreReport:
+    def __init__(self, board: Board, fallback: bool, trials: int, rejected: int) -> None:
+        self.board = board
+        self.fallback = fallback
+        self.trials = trials
+        self.rejected = rejected
+
+
 class Puzzle:
     def __init__(self, core: Board, final: Board, core_stats: dict, fill_stats: dict, final_stats: dict) -> None:
         self.core = core
@@ -111,25 +127,29 @@ class Puzzle:
 
 
 def metrics(board: Board) -> dict:
+    logic = analyze_logic(board)
+    visual = analyze_visual(board)
     area = board.size * board.size
     filled = len(board.occupied)
-    free = sum(1 for arrow in board.arrows if can_move(arrow, board))
-    blockers = _blocker_map(board)
-    curved = sum(1 for arrow in board.arrows if bend_count(arrow.cells) > 0)
-    solved_order, error = solve_board(board)
     return {
-        "arrows": len(board.arrows),
+        "arrows": logic["arrows"],
         "area": area,
         "filled": filled,
         "empty": area - filled,
-        "blocks": sum(len(items) for items in blockers.values()),
-        "depth": _chain_depth(blockers),
-        "free": free,
-        "blocked": len(board.arrows) - free,
-        "stages": _stages(board),
-        "curved": curved,
-        "straight": len(board.arrows) - curved,
-        "solved": error is None and len(solved_order) == len(board.arrows),
+        "blocks": logic["blocks"],
+        "depth": logic["depth"],
+        "free": logic["free"],
+        "blocked": logic["arrows"] - logic["free"],
+        "stages": logic["stages"],
+        "curve": logic["curve"],
+        "curved": visual["curved"],
+        "straight": visual["straight"],
+        "solved": logic["solved"],
+        "logic": logic["score"],
+        "visual": visual["score"],
+        "logic_parts": logic["parts"],
+        "visual_parts": visual["parts"],
+        "isolated": logic["isolated"],
     }
 
 
@@ -138,7 +158,10 @@ def _report(seed: int, core_stats: dict, fill_stats: dict, final_stats: dict) ->
         f"[core] seed={seed} arrows={core_stats['arrows']} "
         f"cover={core_stats['filled']}/{core_stats['area']} "
         f"blocks={core_stats['blocks']} depth={core_stats['depth']} "
-        f"free={core_stats['free']}",
+        f"free={core_stats['free']} logic={core_stats['logic']:.3f} "
+        f"visual={core_stats['visual']:.3f} "
+        f"fallback={'yes' if core_stats['fallback'] else 'no'} "
+        f"rejected={core_stats['rejected']}",
         flush=True,
     )
     print(
@@ -151,7 +174,8 @@ def _report(seed: int, core_stats: dict, fill_stats: dict, final_stats: dict) ->
     print(
         f"[final] solved={'yes' if final_stats['solved'] else 'no'} "
         f"time={final_stats['time']:.3f}s "
-        f"stages={final_stats['stages']} free={final_stats['free']}",
+        f"stages={final_stats['stages']} free={final_stats['free']} "
+        f"logic={final_stats['logic']:.3f} visual={final_stats['visual']:.3f}",
         flush=True,
     )
 
@@ -453,11 +477,6 @@ def _blocked_and_free(board: Board) -> tuple[int, int]:
     return total - free, free
 
 
-def _has_opening(board: Board) -> bool:
-    blocked, free = _blocked_and_free(board)
-    return free >= 1 and blocked >= 1
-
-
 def _shape_mix(board: Board) -> tuple[int, int]:
     curved = sum(1 for arrow in board.arrows if bend_count(arrow.cells) > 0)
     straight = len(board.arrows) - curved
@@ -476,69 +495,12 @@ def _acceptable(board: Board) -> bool:
 
 
 def _rank(board: Board) -> tuple:
-    total = len(board.arrows)
-    blocked, free = _blocked_and_free(board)
-    curved, straight = _shape_mix(board)
-    multi = sum(1 for arrow in board.arrows if bend_count(arrow.cells) >= 2)
-    majority_blocked = 1 if free <= blocked else 0
-    return (
-        1 if _acceptable(board) else 0,
-        majority_blocked,
-        1 if curved >= 1 and straight >= 1 else 0,
-        blocked,
-        _chain_depth(_blocker_map(board)),
-        curved,
-        multi,
-        total,
+    """Logika, potem kompozycja, pokrycie dopiero na końcu."""
+    return selection_key(
+        analyze_logic(board)["score"],
+        analyze_visual(board)["score"],
+        len(board.occupied),
     )
-
-
-def _blocker_map(board: Board) -> dict[int, list[int]]:
-    blockers = {arrow.id: [] for arrow in board.arrows}
-    for arrow in board.arrows:
-        seen: set[int] = set()
-        for cell in exit_cells(arrow, board.size):
-            owner = board.occupied.get(cell)
-            if owner is None or owner == arrow.id or owner in seen:
-                continue
-            seen.add(owner)
-            blockers[arrow.id].append(owner)
-    return blockers
-
-
-def _chain_depth(blockers: dict[int, list[int]]) -> int:
-    memo: dict[int, int] = {}
-    visiting: set[int] = set()
-
-    def depth(arrow_id: int) -> int:
-        if arrow_id in memo:
-            return memo[arrow_id]
-        if arrow_id in visiting:
-            return 1
-        visiting.add(arrow_id)
-        best = 1
-        for blocker in blockers.get(arrow_id, ()):
-            best = max(best, 1 + depth(blocker))
-        visiting.remove(arrow_id)
-        memo[arrow_id] = best
-        return best
-
-    if not blockers:
-        return 0
-    return max(depth(arrow_id) for arrow_id in blockers)
-
-
-def _stages(board: Board) -> int:
-    work = board.copy()
-    stages = 0
-    while work.arrows:
-        movable = [arrow for arrow in work.arrows if can_move(arrow, work)]
-        if not movable:
-            break
-        stages += 1
-        for arrow in movable:
-            work.remove(arrow.id)
-    return stages
 
 
 def _emergency_board(size: int = 12) -> Board:
